@@ -239,11 +239,8 @@ describe('handleMessages — cache_control round-trip into Anthropic usage shape
 
 // When the upstream reports NO cache tokens (DEVIN_CONNECT free tier never
 // does), but the request marked a cacheable prefix with cache_control, the
-// proxy falls back to a LOCAL, CJK-aware estimate of the prefix size so
-// Claude Code sees a non-zero, deterministic cache_creation_input_tokens
-// instead of a misleading 0. A real upstream number always wins over the
-// estimate. (unverified: local estimate — true values need a paid account to
-// calibrate; see PAID ledger task E.)
+// Policy estimates remain useful for request handling. They are not measured
+// cache writes and must not enter response usage fields.
 describe('extractCachePolicy — local cache-prefix token estimate', () => {
   it('estimates the cumulative prefix at the deepest breakpoint', () => {
     const body = {
@@ -308,7 +305,7 @@ describe('extractCachePolicy — local cache-prefix token estimate', () => {
   });
 });
 
-describe('handleMessages — local cache estimate fallback when upstream reports none', () => {
+describe('handleMessages — cache policy never fabricates upstream usage', () => {
   // A cacheable prefix that clears the C2 minimum (Sonnet/Opus ~1024 tokens).
   // ASCII estimates at ~chars/4, so ~5000 chars → ~1250 tokens > 1024.
   const BIG_ASCII_PREFIX = 'cached system prompt block here. '.repeat(160); // >1024 est
@@ -354,7 +351,7 @@ describe('handleMessages — local cache estimate fallback when upstream reports
     assert.ok(seenPolicy.estCacheCreationTokens > 0);
   });
 
-  it('fills cache_creation_input_tokens from the local estimate (5m default)', async () => {
+  it('does not turn a 5m prefix estimate into cache creation', async () => {
     const result = await handleMessages({
       model: 'claude-sonnet-4.6',
       max_tokens: 16,
@@ -363,10 +360,10 @@ describe('handleMessages — local cache estimate fallback when upstream reports
     }, bareUsageChat());
     assert.equal(result.status, 200);
     const u = result.body.usage;
-    // Non-zero estimate instead of a misleading 0 (prefix clears the C2 floor).
-    assert.ok(u.cache_creation_input_tokens > 0);
+    // A large cacheable prefix is not evidence of an upstream write.
+    assert.equal(u.cache_creation_input_tokens, 0);
     assert.equal(u.cache_read_input_tokens, 0);
-    // Default ttl 5m bucket carries the estimate.
+    // Neither TTL bucket invents usage.
     assert.equal(u.cache_creation.ephemeral_5m_input_tokens, u.cache_creation_input_tokens);
     assert.equal(u.cache_creation.ephemeral_1h_input_tokens, 0);
     // Invariant preserved.
@@ -393,7 +390,7 @@ describe('handleMessages — local cache estimate fallback when upstream reports
     assert.equal(u.cache_creation.ephemeral_1h_input_tokens, 0);
   });
 
-  it('routes the estimate to the 1h bucket when a 1h marker is present', async () => {
+  it('does not turn a 1h prefix estimate into cache creation', async () => {
     const result = await handleMessages({
       model: 'claude-sonnet-4.6',
       max_tokens: 16,
@@ -402,7 +399,7 @@ describe('handleMessages — local cache estimate fallback when upstream reports
     }, bareUsageChat());
     assert.equal(result.status, 200);
     const u = result.body.usage;
-    assert.ok(u.cache_creation_input_tokens > 0);
+    assert.equal(u.cache_creation_input_tokens, 0);
     assert.equal(u.cache_creation.ephemeral_1h_input_tokens, u.cache_creation_input_tokens);
     assert.equal(u.cache_creation.ephemeral_5m_input_tokens, 0);
     assert.equal(
@@ -411,10 +408,8 @@ describe('handleMessages — local cache estimate fallback when upstream reports
     );
   });
 
-  // C6: a request that mixes a 5m and a 1h breakpoint must split the estimated
-  // prefix per TTL (each breakpoint owns the incremental prefix since the last
-  // one), not collapse everything into the 1h bucket via the old has1h binary.
-  it('splits a mixed 5m + 1h prefix estimate per TTL bucket (C6)', async () => {
+  // Mixed TTL hints must not manufacture cache usage either.
+  it('does not fabricate either TTL bucket from mixed prefix estimates', async () => {
     const result = await handleMessages({
       model: 'claude-sonnet-4.6',
       max_tokens: 16,
@@ -426,9 +421,9 @@ describe('handleMessages — local cache estimate fallback when upstream reports
     }, bareUsageChat());
     assert.equal(result.status, 200);
     const u = result.body.usage;
-    // Both buckets are populated (mixed TTL), not just the 1h one.
-    assert.ok(u.cache_creation.ephemeral_5m_input_tokens > 0, '5m segment attributed');
-    assert.ok(u.cache_creation.ephemeral_1h_input_tokens > 0, '1h segment attributed');
+    // Neither bucket is populated without an upstream measurement.
+    assert.equal(u.cache_creation.ephemeral_5m_input_tokens, 0);
+    assert.equal(u.cache_creation.ephemeral_1h_input_tokens, 0);
     // Mutual exclusion / invariant: buckets sum to the flat total.
     assert.equal(
       u.cache_creation.ephemeral_5m_input_tokens + u.cache_creation.ephemeral_1h_input_tokens,
@@ -441,13 +436,10 @@ describe('handleMessages — local cache estimate fallback when upstream reports
     );
   });
 
-  // B6 + B7: when the estimate is substituted, the three buckets
-  // (input_tokens / cache_creation / cache_read) must be mutually exclusive —
-  // the prefix must not be double-counted into input_tokens — and the estimate
-  // must be clamped so cache_creation never exceeds the total prompt.
-  it('keeps input/creation/read mutually exclusive and clamps the estimate (B6/B7)', async () => {
+  // Missing cache fields must not reclassify measured input as cache writes.
+  it('preserves measured input when cache usage is absent', async () => {
     // Upstream reports a prompt_tokens SMALLER than the raw prefix estimate to
-    // exercise the clamp; no cache fields so the local estimate is used.
+    // verify it remains measured input even without cache fields.
     const clampChat = {
       async handleChatCompletions(body) {
         return {
@@ -468,9 +460,9 @@ describe('handleMessages — local cache estimate fallback when upstream reports
     }, clampChat);
     assert.equal(result.status, 200);
     const u = result.body.usage;
-    // B7: clamped to promptTotal (500), not the larger raw estimate.
-    assert.ok(u.cache_creation_input_tokens <= 500, 'creation clamped to promptTotal');
-    assert.ok(u.cache_creation_input_tokens > 0);
+    // No measured cache creation; all 500 tokens remain input.
+    assert.equal(u.input_tokens, 500);
+    assert.equal(u.cache_creation_input_tokens, 0);
     // B6: input + creation + read never exceeds the total prompt (no double
     // count of the prefix into input_tokens).
     assert.ok(
@@ -479,10 +471,8 @@ describe('handleMessages — local cache estimate fallback when upstream reports
     );
   });
 
-  it('CJK cache_control content is estimated with CJK weighting in usage', async () => {
-    // CJK weights ~1 token/char, so ~1200 CJK chars clears the C2 floor;
-    // the same char count in ASCII (~chars/4) does NOT, so it emits 0. This
-    // still demonstrates the CJK weighting (CJK creation > ASCII creation).
+  it('neither CJK nor ASCII cache estimates become billed cache writes', async () => {
+    // Different token estimates still cannot prove cache creation.
     const sameCharCount = 1200;
     const asciiResult = await handleMessages({
       model: 'claude-sonnet-4.6',
@@ -497,10 +487,8 @@ describe('handleMessages — local cache estimate fallback when upstream reports
       messages: [{ role: 'user', content: 'hi' }],
     }, bareUsageChat());
     // Same char count but CJK estimated far higher than ASCII.
-    assert.ok(
-      cjkResult.body.usage.cache_creation_input_tokens >
-      asciiResult.body.usage.cache_creation_input_tokens,
-    );
+    assert.equal(cjkResult.body.usage.cache_creation_input_tokens, 0);
+    assert.equal(asciiResult.body.usage.cache_creation_input_tokens, 0);
   });
 
   it('does NOT override a real upstream cache number with the estimate', async () => {
