@@ -33,6 +33,16 @@ node --import ./test/setup-env.mjs --test \
   test/cache-control.test.js test/messages.test.js test/tool-emulation.test.js
 ```
 
+The local continuity selector allowlist adds `DEVIN_CONNECT_SESSION_MODELS`.
+When set to comma-separated upstream selectors, session lookup, ModelConfig
+lookup, reasoning lookup, and successful-response commits only run for those
+selectors. An unset allowlist preserves upstream's global-switch behavior.
+
+The deployed SWE-2 configuration enables `DEVIN_CONNECT_SESSION_REUSE=1` and
+`DEVIN_CONNECT_MODEL_CONFIG_STABLE=1`, restricted to `swe-2-medium,swe-2-high,swe-2-max`.
+Reasoning injection remains off. Controlled experiments identified regenerated
+ModelConfig IDs as a cause of cache misses; stable IDs restored measured cache
+reads. This does not guarantee cache retention across all upstream requests.
+
 Do not replace this checkout with a clean upstream tree without carrying the two
-message-conversion patches forward. Neither patch establishes that SWE 2's
-upstream cache hit rate has improved.
+message-conversion patches and the continuity selector allowlist forward.

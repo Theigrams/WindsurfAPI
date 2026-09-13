@@ -59,7 +59,7 @@ import { resolveConnectSelector } from '../devin-connect-models.js';
 import { isRetryable as isConnectRetryable, getToolDefTags, parseToolCallTagMap } from '../devin-connect.js';
 import { isRouterModel, assignModel as _assignModel } from '../devin-connect-catalog.js';
 import { bumpConnect } from '../devin-connect-metrics.js';
-import { resolveSessionId as resolveConnectSessionId, commitAfterResponse as commitConnectSession, getSessionModelConfig as getSessionConnectModelConfig, getSessionReasoningTrail as getSessionConnectReasoningTrail } from '../session-continuity.js';
+import { resolveSessionId as resolveConnectSessionId, commitAfterResponse as commitConnectSession, getSessionModelConfig as getSessionConnectModelConfig, getSessionReasoningTrail as getSessionConnectReasoningTrail, getSessionEnvForModel } from '../session-continuity.js';
 import { newTraceId, traceClientRequest, traceRouting, traceClientResponse, traceEnabled } from '../trace.js';
 import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
 import {
@@ -3498,14 +3498,15 @@ async function _handleChatCompletionsInner(body, context = {}) {
         }
       }
     }
-    const connectSessionId = resolveConnectSessionId(callerKey || '', connectMessages);
+    const connectSessionEnv = getSessionEnvForModel(selector);
+    const connectSessionId = resolveConnectSessionId(callerKey || '', connectMessages, connectSessionEnv);
     if (connectSessionId) {
       connectParams.sessionId = connectSessionId;
-      const modelCfg = getSessionConnectModelConfig(callerKey || '', connectMessages);
+      const modelCfg = getSessionConnectModelConfig(callerKey || '', connectMessages, connectSessionEnv);
       if (modelCfg) connectParams.sessionModelConfig = { id: modelCfg.configId, turn: modelCfg.turn };
-      const reasoningTrail = getSessionConnectReasoningTrail(callerKey || '', connectMessages);
+      const reasoningTrail = getSessionConnectReasoningTrail(callerKey || '', connectMessages, connectSessionEnv);
       if (reasoningTrail) connectParams.continuityTrail = reasoningTrail;
-      log.info(`Chat[${reqId}]: DEVIN_CONNECT session reuse active → session_id=${connectSessionId}${modelCfg ? ` model_config=stable turn=${modelCfg.turn}` : ''} acct=${ccAcct?.account?.id || 'env-token'}`);
+      log.info(`Chat[${reqId}]: DEVIN_CONNECT session reuse active → session_id=${connectSessionId}${modelCfg ? ` model_config=stable config_id=${modelCfg.configId} turn=${modelCfg.turn}` : ''} acct=${ccAcct?.account?.id || 'env-token'}`);
     }
     if (ccAcct) {
       connectParams.token = ccAcct.apiKey;
@@ -3845,7 +3846,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
                     content: r.sr?.content || '',
                     ...(tc?.length ? { tool_calls: tc.map((t, idx) => ({ id: t.id || `tc_${idx}`, function: { name: t.name, arguments: t.argumentsJson || t.arguments || '' } })) } : {}),
                   }];
-                  commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: r.sr?.reasoning || incomingConnectReasoning });
+                  commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: r.sr?.reasoning || incomingConnectReasoning });
                 } catch { /* session commit is best-effort */ }
                 break;
               }
@@ -4006,7 +4007,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
             content: msg?.content || '',
             ...(msg?.tool_calls ? { tool_calls: msg.tool_calls } : {}),
           }];
-          commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: msg?.reasoning_content || incomingConnectReasoning });
+          commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: msg?.reasoning_content || incomingConnectReasoning });
         } catch { /* session commit is best-effort */ }
         return r.out;
       }

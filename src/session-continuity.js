@@ -54,6 +54,13 @@ export function isSessionReuseEnabled(env = process.env) {
   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
 }
 
+/** Limit continuity to explicit upstream selectors when an allowlist is set. */
+export function getSessionEnvForModel(model, env = process.env) {
+  const models = String(env.DEVIN_CONNECT_SESSION_MODELS || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!models.length || models.includes(model)) return env;
+  return { ...env, DEVIN_CONNECT_SESSION_REUSE: '0' };
+}
+
 // ─── Canonicalizer ─────────────────────────────────────────────────────────
 
 function deriveScopeId(callerKey) {
