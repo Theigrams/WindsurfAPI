@@ -45,6 +45,10 @@ Keep the existing ModelConfig/cache settings. Native mode does not add
   before orphan stripping. Result text and images are preserved.
   Unsigned parallel calls retain the existing call/result pairing, with thinking
   on the first call only. Thinking text is not trimmed or promoted into content.
+- In native thinking mode session lookup and response commits use client turn
+  boundaries, before transport-specific tool splitting. A signed parallel turn
+  followed by an unsigned parallel turn must retain the same session/ModelConfig;
+  splitting the latter for the wire must not invalidate earlier signatures.
 - Multiple thinking blocks, redacted thinking, and
   reasoning that resumes after content are rejected. No unverified mapping is
   silently used. Signed mode also rejects local stop-sequence truncation.

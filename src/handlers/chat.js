@@ -3510,12 +3510,17 @@ async function _handleChatCompletionsInner(body, context = {}) {
       }
     }
     const connectSessionEnv = getSessionEnvForModel(selector);
-    const connectSessionId = resolveConnectSessionId(callerKey || '', connectMessages, connectSessionEnv);
+    // Session identity follows client turns, not transport-specific tool splitting.
+    // In native thinking mode a signed batch stays atomic, but an unsigned batch
+    // is interleaved on the wire. Matching that wire history against a committed
+    // unsplit response would invent a new session and invalidate earlier signatures.
+    const connectSessionMessages = nativeThinkingMode(selector) ? messages : connectMessages;
+    const connectSessionId = resolveConnectSessionId(callerKey || '', connectSessionMessages, connectSessionEnv);
     if (connectSessionId) {
       connectParams.sessionId = connectSessionId;
-      const modelCfg = getSessionConnectModelConfig(callerKey || '', connectMessages, connectSessionEnv);
+      const modelCfg = getSessionConnectModelConfig(callerKey || '', connectSessionMessages, connectSessionEnv);
       if (modelCfg) connectParams.sessionModelConfig = { id: modelCfg.configId, turn: modelCfg.turn };
-      const reasoningTrail = getSessionConnectReasoningTrail(callerKey || '', connectMessages, connectSessionEnv);
+      const reasoningTrail = getSessionConnectReasoningTrail(callerKey || '', connectSessionMessages, connectSessionEnv);
       if (reasoningTrail && !nativeThinkingMode(selector)) connectParams.continuityTrail = reasoningTrail;
       log.info(`Chat[${reqId}]: DEVIN_CONNECT session reuse active → session_id=${connectSessionId}${modelCfg ? ` model_config=stable config_id=${modelCfg.configId} turn=${modelCfg.turn}` : ''} acct=${ccAcct?.account?.id || 'env-token'}`);
     }
@@ -3852,7 +3857,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
                 // fires even after an upstream wobble — exactly when reuse helps.
                 try {
                   const tc = r.sr?.toolCalls;
-                  const commitMsgs = [...connectMessages, {
+                  const commitMsgs = [...connectSessionMessages, {
                     role: 'assistant',
                     content: r.sr?.content || '',
                     ...(tc?.length ? { tool_calls: tc.map((t, idx) => ({ id: t.id || `tc_${idx}`, function: { name: t.name, arguments: t.argumentsJson || t.arguments || '' } })) } : {}),
@@ -4013,7 +4018,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
         // Gate-checked + best-effort (no-op when reuse is off).
         try {
           const msg = r.out?.body?.choices?.[0]?.message;
-          const commitMsgs = [...connectMessages, {
+          const commitMsgs = [...connectSessionMessages, {
             role: 'assistant',
             content: msg?.content || '',
             ...(msg?.tool_calls ? { tool_calls: msg.tool_calls } : {}),

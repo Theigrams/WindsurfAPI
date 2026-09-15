@@ -340,6 +340,69 @@ describe('Full HTTP handler chain with only HTTPS transport mocked', () => {
   }
 });
 
+describe('Mixed signed and unsigned parallel turns retain native session identity', () => {
+  for (const stream of [true, false]) it(`keeps the original signature valid on turn three (stream=${stream})`, async () => {
+    const flags = { DEVIN_CONNECT: '1', DEVIN_CONNECT_TOKEN: 'offline-mixed', DEVIN_CONNECT_SESSION_REUSE: '1', DEVIN_CONNECT_MODEL_CONFIG_STABLE: '1', DEVIN_CONNECT_SESSION_MODELS: 'swe-2-high' };
+    const old = Object.fromEntries(Object.keys(flags).map(k => [k, process.env[k]]));
+    const experimental = getExperimental();
+    Object.assign(process.env, flags); setExperimental({ nativeToolCall: true }); resetSessions();
+    const requests = [];
+    __setRequestImpl((_opts, cb) => {
+      const req = new EventEmitter(); req.destroyed = false; req.setTimeout = () => req;
+      req.write = data => requests.push(parseFields(data.subarray(5)));
+      req.destroy = () => { req.destroyed = true; };
+      req.end = () => {
+        const res = new EventEmitter(); res.statusCode = 200; cb(res);
+        const turn = requests.length;
+        setImmediate(() => {
+          const frames = [];
+          if (turn === 1) frames.push(writeStringField(9, thinking), writeStringField(10, signature), writeStringField(21, 'sealed'));
+          if (turn < 3) {
+            frames.push(writeStringField(3, 'Checking.'));
+            for (let i = 0; i < 2; i++) frames.push(writeMessageField(6, Buffer.concat([writeStringField(1, `t${turn}-${i}`), writeStringField(2, 'lookup'), writeStringField(3, JSON.stringify({key:i}))])));
+          } else frames.push(writeStringField(3, '42'));
+          frames.push(writeVarintField(5, 2));
+          for (const f of frames) { if (req.destroyed) return; res.emit('data', wrapEnvelope(f, {compress:false})); }
+          res.emit('data', endOfStreamEnvelope()); res.emit('end');
+        });
+      };
+      return req;
+    });
+    try {
+      const messages = [{ role:'user', content:'First A/B, then C/D, then combine.' }];
+      const body = {model:'swe-2-high', stream, messages, tools:[{name:'lookup',input_schema:{type:'object',properties:{key:{type:'integer'}}}}]};
+      for (let turn=1; turn<=3; turn++) {
+        const reply = await handleMessages(body,{callerKey:'mixed-signature-client'});
+        assert.equal(reply.status,200,JSON.stringify(reply.body?.error));
+        let content;
+        if (stream) {
+          const res=fakeRes();await reply.handler(res);
+          const events=parseEvents(res.body);assert.equal(events.some(e=>e.type==='error'),false,`turn ${turn} must finish`);
+          content=assemble(events);
+        } else content=reply.body.content;
+        const calls=content.filter(b=>b.type==='tool_use');
+        assert.equal(calls.length,turn<3?2:0);
+        if(turn===1)assert.equal(content.find(b=>b.type==='thinking').signature,signature);
+        if(turn===2)assert.equal(content.some(b=>b.type==='thinking'),false,'an unsigned turn must stay unsigned');
+        if(turn===3)assert.equal(content.find(b=>b.type==='text').text,'42');
+        if(turn<3)messages.push({role:'assistant',content},{role:'user',content:calls.toReversed().map(c=>({type:'tool_result',tool_use_id:c.id,content:'7'}))});
+      }
+      assert.equal(requests.length,3);
+      assert.equal(new Set(requests.map(r=>str(r,16))).size,1);
+      const configs=requests.map(r=>parseFields(getField(r,15,2).value));
+      assert.equal(new Set(configs.map(c=>str(c,1))).size,1);
+      assert.deepEqual(configs.map(c=>getField(c,2,0).value),[1,2,3]);
+      const history=getAllFields(requests[2],3).map(f=>parseFields(f.value));
+      const signed=history.filter(r=>str(r,12));assert.equal(signed.length,1);assert.equal(str(signed[0],12),signature);assert.equal(getAllFields(signed[0],6).length,2);
+      const unsigned=history.filter(r=>getAllFields(r,6).length&&!str(r,12));assert.equal(unsigned.length,2,'unsigned wire batches still interleave');
+      assert.deepEqual(history.filter(r=>str(r,7)).map(r=>str(r,7)),['t1-0','t1-1','t2-0','t2-1']);
+    } finally {
+      setExperimental(experimental);resetSessions();
+      for(const [k,v] of Object.entries(old))v===undefined?delete process.env[k]:process.env[k]=v;
+    }
+  });
+});
+
 describe('Anthropic -> adapter -> wire -> response -> next tool request', () => {
   for (const stream of [false, true]) for (const withTool of [false, true]) {
     it(`round-trips signed blocks through real functions (stream=${stream}, tool=${withTool})`, async () => {
