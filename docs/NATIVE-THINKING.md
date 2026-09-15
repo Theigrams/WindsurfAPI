@@ -21,6 +21,10 @@ selecting models. An empty list enables nothing. A selector on both lists uses
 the signed policy. Do not treat the list as a claim that a provider supports
 replay; acceptance must be tested separately for each selector.
 
+Unlisted models with unsigned history keep their legacy conversion behavior.
+Signed history sent to an unlisted selector is rejected to prevent accidental
+cross-model replay.
+
 Signed mode requires an explicit caller scope, account token, stable session,
 and native structured tools when tools are used. For the HTTP route this means
 `DEVIN_CONNECT_SESSION_REUSE=1`, the selector included in any configured

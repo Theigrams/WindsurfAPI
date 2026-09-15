@@ -85,6 +85,20 @@ describe('Native thinking policy and wire fidelity', () => {
     assert.equal(rows.length, 1); assert.equal(str(rows[0], 11), thinking);
     assert.equal(str(rows[0], 12), undefined); assert.equal(str(rows[0], 18), undefined);
   });
+  it('keeps unlisted unsigned models on the legacy wire path without changing caller history', () => {
+    const params = { ...base, model: 'unlisted-model', messages: [{ role: 'assistant', content: 'done', nativeThinkingBlocks: [{ type: 'thinking', thinking }] }] };
+    const before = structuredClone(params);
+    const prepared = prepareNativeThinking(params);
+    assert.equal(prepared.messages[0].nativeThinkingBlocks, undefined);
+    const rows = wire(params);
+    assert.equal(str(rows[0], 3), 'done'); assert.equal(str(rows[0], 11), undefined);
+    assert.deepEqual(params, before);
+  });
+  it('preserves unlisted OpenAI reasoning input for the existing legacy replay gate', () => {
+    const params = { ...base, model: 'unlisted-model', messages: [{ role: 'assistant', content: 'done', reasoning_content: thinking }] };
+    assert.equal(prepareNativeThinking(params).messages[0].reasoning_content, thinking);
+    assert.equal(str(wire(params)[0], 11), undefined);
+  });
   it('never coalesces distinct thinking turns', () => {
     const rows = wire({ ...base, model: 'glm-5-2-max', messages: [1, 2, 3].map(i => ({ role: 'assistant', content: 'ok', reasoning_content: String(i) })) });
     assert.deepEqual(rows.map(r => str(r, 11)), ['1', '2', '3']);

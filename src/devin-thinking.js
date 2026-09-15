@@ -46,8 +46,17 @@ export function prepareNativeThinking(params, now = Date.now()) {
   const mode = nativeThinkingMode(params.model, env);
   const messages = params.messages || [];
   if (!mode) {
-    if (messages.some(m => blocksFor(m).length)) throw thinkingError('history belongs to a model outside the replay allowlist.');
-    return params;
+    if (messages.some(m => blocksFor(m).some(b => b?.signature))) {
+      throw thinkingError('signed history belongs to a model outside the replay allowlist.');
+    }
+    // Capturing Anthropic history happens before final model resolution. Keep
+    // unlisted unsigned models on their legacy path instead of rejecting them
+    // merely because another selector enabled native replay on this process.
+    return { ...params, messages: messages.map(m => {
+      if (!Object.hasOwn(m, 'nativeThinkingBlocks')) return m;
+      const { nativeThinkingBlocks: _blocks, ...legacy } = m;
+      return legacy;
+    }) };
   }
   if (params.continuityTrail) throw thinkingError('native replay cannot be combined with reasoning prompt injection.');
   const scope = mode === 'signed' ? origin(params) : null;
