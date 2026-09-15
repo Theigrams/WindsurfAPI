@@ -47,20 +47,20 @@
     {
       "name": "T2 anthropic-in: incoming thinking no longer captured before the drop",
       "file": "src/handlers/messages.js",
-      "anchor": "        } else if (block.type === 'thinking') {\n          if (typeof block.thinking === 'string' && block.thinking) msgThinking.push(block.thinking);",
-      "replacement": "        } else if (block.type === 'thinking') {"
+      "anchor": "          if (typeof block.thinking === 'string' && block.thinking) msgThinking.push(block.thinking);",
+      "replacement": "          // Mutation: omit incoming thinking capture."
     },
     {
       "name": "T2 stream commit fallback dropped — outbound-empty reasoning no longer falls back to the inbound captured thinking (caught by test/session-continuity-commit-fallback.test.js stream fixture)",
       "file": "src/handlers/chat.js",
-      "anchor": "commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: r.sr?.reasoning || incomingConnectReasoning });",
-      "replacement": "commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: r.sr?.reasoning });"
+      "anchor": "commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: r.sr?.reasoning || incomingConnectReasoning });",
+      "replacement": "commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: r.sr?.reasoning });"
     },
     {
       "name": "T2 non-stream commit fallback dropped — same conjunction on the second call site (caught by the non-stream fixture)",
       "file": "src/handlers/chat.js",
-      "anchor": "commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: msg?.reasoning_content || incomingConnectReasoning });",
-      "replacement": "commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: msg?.reasoning_content });"
+      "anchor": "commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: msg?.reasoning_content || incomingConnectReasoning });",
+      "replacement": "commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: msg?.reasoning_content });"
     },
     {
       "name": "count clamp fractional hole — n=0.5 must fall back to the default 5, not Math.floor to a silent 0 (queue empty, digests gone)",

@@ -26,6 +26,7 @@
  * Zero npm deps. Nothing dials the network at import time.
  */
 
+import { nativeThinkingMode, prepareNativeThinking, thinkingError } from './devin-thinking.js';
 import https from 'https';
 import { StringDecoder } from 'string_decoder';
 import { randomUUID, randomBytes, createHmac } from 'crypto';
@@ -1003,9 +1004,11 @@ function buildCompletionConfig({ maxTokens, temperature, topK, topP, contextWind
  * @param {object}   [params.completion]  CompletionConfig overrides
  * @returns {Buffer} raw protobuf (un-enveloped)
  */
-export function buildGetChatMessageRequest({ token, messages, model, sessionId, completion, tools, nativeToolCall = false, deviceSeed, userJwt, toolChoice, parallelToolCalls, env = process.env, sessionModelConfig, continuityTrail } = {}) {
+export function buildGetChatMessageRequest({ token, messages, model, sessionId, completion, tools, nativeToolCall = false, deviceSeed, userJwt, toolChoice, parallelToolCalls, env = process.env, sessionModelConfig, continuityTrail, nativeThinkingScope } = {}) {
   if (!token) throw new Error('DEVIN_CONNECT: missing session token');
   if (!model) throw new Error('DEVIN_CONNECT: missing model selector');
+  const thinkingMode = nativeThinkingMode(model, env);
+  ({ messages } = prepareNativeThinking({ token, messages, model, sessionId, nativeToolCall, env, continuityTrail, nativeThinkingScope }));
 
   // Probe: gated replay of reasoning into tag #11 (or #9 for negative control).
   // Fact A3 (2026-08-03): upstream swe-1-7 accepts reasoning tags (#11, #9) without error
@@ -1051,7 +1054,7 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
   const isMergeableText = (m) => {
     if (!m || (m.role !== 'user' && m.role !== 'assistant')) return false;
     if (m.tool_calls?.length || m.tool_call_id) return false;
-    if (m.reasoning || m.reasoning_content) return false;
+    if (m.reasoning || m.reasoning_content || m.nativeThinkingBlocks?.length) return false;
     if (Array.isArray(m.content)) return m.content.every((c) => c?.type === 'text');
     return true;
   };
@@ -1085,6 +1088,25 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
         continue;
       }
       systemPrompt += systemPrompt ? `\n${t}` : t;
+      continue;
+    }
+    if (thinkingMode && msg.role === 'assistant' && msg.nativeThinkingBlocks?.length) {
+      const block = msg.nativeThinkingBlocks[0];
+      const parts = [writeStringField(1, randomUUID()), writeVarintField(2, SOURCE.ASSISTANT), writeStringField(3, messageText(msg.content))];
+      for (const tc of msg.tool_calls || []) {
+        const raw = tc.function?.arguments ?? tc.arguments ?? {};
+        parts.push(writeMessageField(6, Buffer.concat([
+          writeStringField(1, tc.id || randomUUID()),
+          writeStringField(2, tc.function?.name || tc.name || 'unknown'),
+          writeStringField(3, typeof raw === 'string' ? raw : JSON.stringify(raw)),
+        ])));
+      }
+      if (block.thinking) parts.push(writeStringField(11, block.thinking));
+      if (block.signature) {
+        parts.push(writeStringField(12, block.signature));
+        parts.push(writeStringField(18, block.signatureType));
+      }
+      chatMessages.push(Buffer.concat(parts));
       continue;
     }
     // Empty assistant turns are sent verbatim upstream and measurably provoke repeated
@@ -1453,19 +1475,8 @@ export function parseToolCallTagMap(env = process.env, { useDefault = false } = 
   return map.outer ? map : null;
 }
 
-// Thinking-signature DECODE config (GROUNDWORK, opt-in). The response declares
-// `delta_signature` (string, the encrypted-thinking payload increment),
-// `delta_signature_type` (enum) and `thinking_id` (string) at the top level —
-// names [verified] from recon, wire tags [unknown] (free tier never emits them).
-// Default OFF: until a paid/thinking capture pins the tags, nothing is decoded
-// and streamChat yields exactly as today (zero regression).
-//
-//   DEVIN_CONNECT_SIGNATURE_TAG=N           (the delta_signature tag; mandatory)
-//   DEVIN_CONNECT_SIGNATURE_TYPE_TAG=N       (delta_signature_type; optional)
-//   DEVIN_CONNECT_SIGNATURE_THINKING_ID_TAG=N (thinking_id; optional)
-//
-// `signature` is mandatory — without the delta_signature tag there is nothing to
-// surface, so the whole map is null (decode stays off) when it's unset/garbage.
+// Legacy experimental tag overrides (integer type). The new native-thinking
+// path uses the CPA-verified response mapping #10 bytes / #21 string instead.
 export function parseSignatureTagMap(env = process.env) {
   const sigTag = Number.parseInt(env.DEVIN_CONNECT_SIGNATURE_TAG || '', 10);
   if (!Number.isInteger(sigTag) || sigTag <= 0 || sigTag >= 536870912) return null;
@@ -1703,34 +1714,23 @@ export function decodeFrame(payload, opts = {}) {
   // DEVIN_CONNECT_ACTUAL_MODEL_TAG (calibrated value = 9). Off = null, no change.
   let actualModel = null;
 
-  // Thinking signature (delta_signature / delta_signature_type / thinking_id):
-  // top-level GetChatMessageResponse fields, the SAME layer as delta_thinking
-  // (#9) — see NATIVE-WIRE-FIELDS §5. The reverse-engineering CONFIRMED the
-  // field names [verified]; the earlier "upstream never produces a signature"
-  // belief was wrong. But free swe-1.6 frames never carry them (free tier
-  // produces no thinking signature), so the wire TAGS are [unknown] from every
-  // capture we have. Opt-in via opts.signatureTags (default OFF → never decoded,
-  // zero behavioral change). `delta_signature` is a declared string field — an
-  // opaque encrypted payload the client only round-trips — so it is surfaced
-  // verbatim as utf8 with NO printable filter (a base64 signature is preserved
-  // byte-for-byte; mangling it would break the round-trip the upstream expects).
+  // Native response #10 is opaque signature data and #21 is a string type.
+  // Legacy numeric tag probes remain compatible outside native-thinking mode.
   let signature = null;
-  if (opts.signatureTags && opts.signatureTags.signature) {
-    const sig = getField(fields, opts.signatureTags.signature, 2);
-    if (sig) {
-      signature = { text: sig.value.toString('utf8') };
-      // delta_signature_type: enum/int distinguishing anthropic vs gemini vs none.
-      if (opts.signatureTags.type) {
-        const t = getField(fields, opts.signatureTags.type, 0);
-        if (t) signature.signatureType = Number(t.value);
-      }
-      // thinking_id: binds the signature to a specific thinking block (string).
-      if (opts.signatureTags.thinkingId) {
-        const ti = getField(fields, opts.signatureTags.thinkingId, 2);
-        if (ti) {
-          const s = ti.value.toString('utf8');
-          if (/^[\x20-\x7e]+$/.test(s)) signature.thinkingId = s; // printable id only
-        }
+  if (opts.signatureTags?.signature) {
+    const tags = opts.signatureTags;
+    const sigFields = getAllFields(fields, tags.signature).filter(f => f.wireType === 2);
+    const t = tags.type ? getField(fields, tags.type, tags.typeWire ?? 0) : null;
+    if (sigFields.length || t) {
+      const raw = Buffer.concat(sigFields.map(f => f.value));
+      let text;
+      try { text = tags.typeWire === 2 ? new TextDecoder('utf-8', { fatal: true }).decode(raw) : raw.toString('utf8'); }
+      catch { throw thinkingError('non-UTF-8 signature has no supported JSON representation.'); }
+      signature = { text };
+      if (t) signature.signatureType = tags.typeWire === 2 ? t.value.toString('utf8') : Number(t.value);
+      if (tags.thinkingId) {
+        const ti = getField(fields, tags.thinkingId, 2);
+        if (ti) signature.thinkingId = ti.value.toString('utf8');
       }
     }
   }
@@ -2301,7 +2301,7 @@ export function resolveFinishReason(finish, usage, maxTokens, env = process.env)
 export async function* streamChat({
   messages, model, sessionId, completion, tools,
   token, signal, timeoutMs, deadlineMs, host, env = process.env, nativeToolCall = false, traceId = null,
-  deviceSeed, sessionModelConfig, continuityTrail,
+  deviceSeed, sessionModelConfig, continuityTrail, nativeThinkingScope,
 } = {}) {
   if (signal?.aborted) {
     const err = new Error('The operation was aborted');
@@ -2332,10 +2332,9 @@ export async function* streamChat({
   // Optional: native tool-call decode (repeated ChatToolCall) when the response
   // tags are calibrated. Off → tool calls come from prompt emulation as today.
   const toolCallTags = parseToolCallTagMap(env, { useDefault: nativeToolCall });
-  // Optional: thinking-signature decode (delta_signature/_type/thinking_id) when
-  // DEVIN_CONNECT_SIGNATURE_TAG is pinned from a paid/thinking capture. Off →
-  // never decoded, messages.js keeps its empty-string signature placeholder.
-  const signatureTags = parseSignatureTagMap(env);
+  // Decode signatures only for explicitly enabled native models or legacy tag probes.
+  const signatureTags = nativeThinkingMode(model, env)
+    ? { signature: 10, type: 21, typeWire: 2 } : parseSignatureTagMap(env);
   // Request-side tool names, for the native-decode name fallback (response-side
   // ChatToolCall carries no name — see decodeToolCalls header). Only collected when
   // native decode is actually on, so it costs nothing on the default path. The
@@ -2356,7 +2355,7 @@ export async function* streamChat({
   const userJwt = isUserJwtEnabled(env)
     ? await mintUserJwt(sessionToken, { host: HOST, signal, deviceSeed })
     : undefined;
-  const proto = buildGetChatMessageRequest({ token: sessionToken, messages, model, sessionId, completion, tools, nativeToolCall, deviceSeed, userJwt, env, sessionModelConfig, continuityTrail });
+  const proto = buildGetChatMessageRequest({ token: sessionToken, messages, model, sessionId, completion, tools, nativeToolCall, deviceSeed, userJwt, env, sessionModelConfig, continuityTrail, nativeThinkingScope });
   // Request envelope is sent UNCOMPRESSED (flag 0). The live calibration showed
   // the server rejects a gzipped request frame with an opaque "internal" error;
   // it still streams gzipped frames back, which the parser handles.
@@ -2496,7 +2495,10 @@ export async function* streamChat({
           pump();
           return;
         }
-        const { contentBytes, reasoningBytes, finish, usage, billing, metaDump, frameDump, subDump, actualModel, toolCalls, signature } = decodeFrame(frame.payload, { billingTags, dumpMeta, actualModelTag, toolCallTags, signatureTags, toolNames });
+        let decoded;
+        try { decoded = decodeFrame(frame.payload, { billingTags, dumpMeta, actualModelTag, toolCallTags, signatureTags, toolNames }); }
+        catch (err) { streamError = err; done = true; req.destroy(); pump(); return; }
+        const { contentBytes, reasoningBytes, finish, usage, billing, metaDump, frameDump, subDump, actualModel, toolCalls, signature } = decoded;
         // wire-01: decode across frame boundaries so split multi-byte chars survive.
         const content = contentBytes ? contentDecoder.write(contentBytes) : '';
         const reasoning = reasoningBytes ? reasoningDecoder.write(reasoningBytes) : '';
@@ -2526,6 +2528,7 @@ export async function* streamChat({
           // ignore it; zero regression when the tag is uncalibrated (signature
           // is null and this whole branch is dead).
           lastSignature = {
+            ...lastSignature,
             text: (lastSignature ? lastSignature.text : '') + signature.text,
             ...(signature.signatureType != null ? { signatureType: signature.signatureType } : {}),
             ...(signature.thinkingId != null ? { thinkingId: signature.thinkingId } : {}),
@@ -2652,10 +2655,7 @@ export async function* streamChat({
           // Native tool calls (repeated ChatToolCall) when DEVIN_CONNECT_TOOL_CALL_TAGS
           // is calibrated. Empty otherwise — prompt emulation owns tool calls today.
           toolCalls: nativeToolCalls.length ? nativeToolCalls : null,
-          // Full thinking signature (concatenated delta_signature) when
-          // DEVIN_CONNECT_SIGNATURE_TAG is calibrated. Null on free tier /
-          // un-configured deployments — messages.js then keeps its empty-string
-          // signature_delta placeholder (forward-compatible round-trip).
+          // Full opaque signature and type; unsigned replies keep these null.
           reasoning_signature: lastSignature ? lastSignature.text : null,
           signature: lastSignature,
         };

@@ -18,8 +18,9 @@
  */
 
 import { randomUUID } from 'crypto';
+import { nativeThinkingMode, prepareNativeThinking, nativeThinkingEvents, thinkingError } from './devin-thinking.js';
 import { filterToolCallsByAllowlist } from './handlers/chat.js';
-import { streamChat as realStreamChat, isRetryable, messageText } from './devin-connect.js';
+import { streamChat as realStreamChat, isRetryable, messageText, getConnectToken } from './devin-connect.js';
 import { ToolCallStreamParser, parseToolCallsFromText, isWeakEmulationModel } from './handlers/tool-emulation.js';
 import { log } from './config.js';
 import { leakTraceEnabled, thinkMarkersIn, leakSample } from './leak-trace.js';
@@ -136,6 +137,13 @@ function isEmptyCompletion(finishEv, sawContent) {
 // defect). If a caller ever genuinely needs to opt out, add the option back THEN, with a test
 // that passes `false` — that test is what makes it a knob rather than decoration.
 async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opts = {}) {
+  params = prepareNativeThinking({ ...params, token: params.token || getConnectToken(params.env || env) });
+  if (nativeThinkingMode(params.model, params.env || env)) {
+    if (params.tools?.length && !params.nativeToolCall) throw thinkingError('native thinking requires native tool definitions.');
+    if (nativeThinkingMode(params.model, params.env || env) === 'signed' && opts.stop?.length) throw thinkingError('signed replay does not support local stop truncation.');
+    yield* nativeThinkingEvents(streamChatImpl(params), params);
+    return;
+  }
   // Weak models (fable) return DETERMINISTIC empties on complex multi-turn / large
   // system — paid E2E (2026-07-08, 27/27) proved retry never heals them, it only
   // triples the upstream load and burns the account into a 3h rate limit. So for
@@ -387,6 +395,7 @@ function nowSeconds() {
 export async function toChatCompletion(params, opts = {}) {
   const { id = newId(), created = nowSeconds(), displayModel, maxRetries = 2, retryBaseMs = 400, emulateTools = false, stop = null, clineCompat = false } = opts;
   const model = displayModel || params.model;
+  const nativeMode = nativeThinkingMode(params.model, params.env || process.env);
 
   // Non-stream path buffers the whole answer, so a transient failure (network
   // blip, 5xx, rate limit) can be retried cleanly — a discarded partial buffer
@@ -394,6 +403,7 @@ export async function toChatCompletion(params, opts = {}) {
   // are not retryable and throw straight through for the handler to map.
   let content = '';
   let reasoning = '';
+  let reasoningSignature = '';
   let finishReason = 'stop';
   let usage = null;
   // Per-request billing detail (credit / ACU cost) when the operator has calibrated
@@ -407,13 +417,14 @@ export async function toChatCompletion(params, opts = {}) {
   let nativeToolCalls = [];
   for (let attempt = 0; ; attempt++) {
     try {
-      content = ''; reasoning = ''; finishReason = 'stop'; usage = null; nativeToolCalls = [];
+      content = ''; reasoning = ''; reasoningSignature = ''; finishReason = 'stop'; usage = null; nativeToolCalls = [];
       for await (const ev of streamChatWithEmptyRetry(params, undefined, opts)) {
         // A rescue attempt REPLACES the previous one; drop what it produced or the
         // client is handed every attempt concatenated.
-        if (ev.type === 'attempt_reset') { content = ''; reasoning = ''; nativeToolCalls = []; billing = null; continue; }
+        if (ev.type === 'attempt_reset') { content = ''; reasoning = ''; reasoningSignature = ''; nativeToolCalls = []; billing = null; continue; }
         if (ev.type === 'content') content += ev.text;
         else if (ev.type === 'reasoning') reasoning += ev.text;
+        else if (ev.type === 'signature') reasoningSignature += ev.reasoning_signature || '';
         else if (ev.type === 'finish') {
           if (ev.reason) finishReason = ev.reason;
           if (ev.usage) usage = ev.usage;
@@ -423,7 +434,7 @@ export async function toChatCompletion(params, opts = {}) {
       }
       break;
     } catch (err) {
-      if (!isRetryable(err) || attempt >= maxRetries) throw err;
+      if (nativeMode || !isRetryable(err) || attempt >= maxRetries) throw err;
       const backoff = retryBaseMs * 2 ** attempt;
       log.warn(`DEVIN_CONNECT: retryable error (${err.code || err.message}); retry ${attempt + 1}/${maxRetries} in ${backoff}ms`);
       await new Promise((r) => setTimeout(r, backoff));
@@ -458,7 +469,7 @@ export async function toChatCompletion(params, opts = {}) {
       id: tc.id, name: tc.name, argumentsJson: tc.arguments,
     }));
     finishReason = 'tool_calls';
-  } else if (emulateTools && !stopHit) {
+  } else if (!nativeMode && emulateTools && !stopHit) {
     const parsed = parseToolCallsFromText(content, {
       modelKey: params.model, provider: null, route: 'devin_connect',
     });
@@ -485,7 +496,7 @@ export async function toChatCompletion(params, opts = {}) {
   // `<tool_call>` XML to the client as the visible answer with finish_reason='stop'.
   // The agent loop does not advance and the user sees markup, which is worse than
   // the empty turn the promotion exists to prevent.
-  let promotedReasoning = !toolCalls.length && !content && !!reasoning;
+  let promotedReasoning = !nativeMode && !toolCalls.length && !content && !!reasoning;
   if (promotedReasoning) {
     if (emulateTools && !stopHit) {
       const promotedParse = parseToolCallsFromText(reasoning, {
@@ -511,16 +522,17 @@ export async function toChatCompletion(params, opts = {}) {
 
   // OpenAI convention: content is a string (may be empty), never undefined.
   const message = { role: 'assistant', content: content || '' };
-  if (reasoning && !promotedReasoning) message.reasoning_content = reasoning;
+  if ((reasoning || reasoningSignature) && !promotedReasoning) message.reasoning_content = reasoning;
+  if (reasoningSignature) message.reasoning_signature = reasoningSignature;
   if (toolCalls.length) {
     message.tool_calls = toolCalls.map((tc, i) => ({
       id: tc.id || `call_${i}_${Date.now().toString(36)}`,
       type: 'function',
-      function: { name: tc.name || 'unknown', arguments: compatArgs(tc.argumentsJson || tc.arguments, clineCompat) },
+      function: { name: tc.name || 'unknown', arguments: compatArgs(tc.argumentsJson || tc.arguments, !nativeMode && clineCompat) },
     }));
     // content is null when the turn is a tool call (the inline text is usually
     // a hallucinated preview the caller shouldn't show).
-    message.content = null;
+    if (!nativeMode) message.content = null;
     finishReason = 'tool_calls';
   }
 
@@ -562,6 +574,7 @@ export async function toChatCompletion(params, opts = {}) {
 export async function streamChatCompletion(params, send, opts = {}) {
   const { id = newId(), created = nowSeconds(), displayModel, emulateTools = false, includeUsage = false, stop = null, clineCompat = false } = opts;
   const model = displayModel || params.model;
+  const nativeMode = nativeThinkingMode(params.model, params.env || process.env);
   const base = { id, object: OBJECT_CHUNK, created, model, system_fingerprint: systemFingerprint(model) };
 
   // 1. Role-priming chunk. This USED to fire eagerly here, before streamChat
@@ -586,6 +599,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
 
   let content = '';
   let reasoning = '';
+  let reasoningSignature = '';
   let finishReason = 'stop';
   let usage = null;
   // Same billing passthrough as the non-stream path.
@@ -616,7 +630,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
   // surfaces fully-closed calls; we emit each as an OpenAI tool_calls delta
   // (whole arguments at once, keyed by index — matching Cascade, not
   // token-by-token argument streaming). finish_reason flips to tool_calls.
-  const toolParser = emulateTools
+  const toolParser = !nativeMode && emulateTools
     ? new ToolCallStreamParser({ modelKey: params.model, provider: null, route: 'devin_connect' })
     : null;
   const collectedToolCalls = [];
@@ -648,6 +662,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
     // attempt concatenated, and the promotion re-sends that pile as the answer.
     if (ev.type === 'attempt_reset') {
       reasoning = '';
+      reasoningSignature = '';
       content = '';
       collectedToolCalls.length = 0;
       nativeToolCalls = [];
@@ -657,6 +672,10 @@ export async function streamChatCompletion(params, send, opts = {}) {
       prime(); // first real delta: emit the deferred role chunk first
       reasoning += ev.text;
       send({ ...base, choices: [{ index: 0, delta: { reasoning_content: ev.text }, finish_reason: null }] });
+    } else if (ev.type === 'signature') {
+      prime();
+      reasoningSignature += ev.reasoning_signature || '';
+      send({ ...base, choices: [{ index: 0, delta: { reasoning_signature: ev.reasoning_signature }, finish_reason: null }] });
     } else if (ev.type === 'content') {
       prime(); // first real delta: emit the deferred role chunk first
       content += ev.text;
@@ -726,7 +745,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
   // recorded here rather than left to look like an oversight; if a future change
   // can dedupe at the translator layer (messages.js already knows whether the
   // text block equals the thinking block), that is the place to do it.
-  if (!content && !collectedToolCalls.length && !nativeToolCalls.length && reasoning && !stopHit) {
+  if (!nativeMode && !content && !collectedToolCalls.length && !nativeToolCalls.length && reasoning && !stopHit) {
     // Same extraction the content path uses, for the same reason as the non-stream
     // path: the rescue nudge asks for tool markup, so a model that complies while
     // still writing into the reasoning channel would otherwise have raw

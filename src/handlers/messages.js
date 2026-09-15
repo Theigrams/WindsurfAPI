@@ -12,6 +12,7 @@
  */
 
 import { createHash, randomUUID } from 'crypto';
+import { nativeThinkingEnabled } from '../devin-thinking.js';
 import { handleChatCompletions, connectErrorToHttp } from './chat.js';
 import { log } from '../config.js';
 import { leakTraceEnabled, thinkMarkersIn, leakSample } from '../leak-trace.js';
@@ -614,6 +615,7 @@ function anthropicToOpenAI(body, ccActive = false) {
       const toolCalls = [];
       const toolResults = [];
       const msgThinking = [];
+      const nativeThinkingBlocks = [];
       for (const block of m.content) {
         if (block.type === 'text') {
           textParts.push(block.text || '');
@@ -644,7 +646,12 @@ function anthropicToOpenAI(body, ccActive = false) {
             textParts.push(`[document: ${label} — content not extracted]`);
             log.info(`messages: document block (${mt}) not decoded — forwarded as text placeholder`);
           }
+        } else if (block.type === 'redacted_thinking' && role === 'assistant' && nativeThinkingEnabled()) {
+          nativeThinkingBlocks.push({ type: block.type, data: block.data });
         } else if (block.type === 'thinking') {
+          if (role === 'assistant' && nativeThinkingEnabled()) {
+            nativeThinkingBlocks.push({ type: 'thinking', thinking: block.thinking ?? '', ...(block.signature != null ? { signature: block.signature } : {}) });
+          }
           if (typeof block.thinking === 'string' && block.thinking) msgThinking.push(block.thinking);
           // Incoming assistant thinking blocks are dropped on history translation:
           // 1) Upstream swe-1-7 (K2 family) accepts outgoing candidate tag #11 in ChatMessage,
@@ -674,8 +681,10 @@ function anthropicToOpenAI(body, ccActive = false) {
       // Tool results must directly follow the assistant tool_calls message
       // in OpenAI format. Push them before the user content message.
       for (const tr of toolResults) messages.push(tr);
+      const nativeMeta = nativeThinkingBlocks.length ? { nativeThinkingBlocks } : {};
       if (toolCalls.length) {
         messages.push({
+          ...nativeMeta,
           role: 'assistant',
           content: textParts.length ? textParts.join('\n') : null,
           tool_calls: toolCalls,
@@ -683,9 +692,11 @@ function anthropicToOpenAI(body, ccActive = false) {
       } else if (imageParts.length) {
         const contentArr = [...imageParts];
         if (textParts.length) contentArr.push({ type: 'text', text: textParts.join('\n') });
-        messages.push({ role, content: contentArr });
+        messages.push({ role, content: contentArr, ...nativeMeta });
       } else if (textParts.length) {
-        messages.push({ role, content: textParts.join('\n') });
+        messages.push({ role, content: textParts.join('\n'), ...nativeMeta });
+      } else if (nativeThinkingBlocks.length) {
+        messages.push({ role, content: '', ...nativeMeta });
       }
     }
   }
@@ -815,17 +826,11 @@ export function openAIToAnthropic(result, model, msgId, cachePolicy = null, stop
   const choice = result.choices?.[0];
   const usage = result.usage || {};
   const content = [];
-  if (choice?.message?.reasoning_content) {
-    // Anthropic thinking blocks may carry an opaque encrypted `signature` that
-    // the *real* Anthropic server decrypts on multi-turn replay. Our upstream
-    // (Devin #9 / Cascade) never emits one, so when it is missing we omit the
-    // field entirely rather than emitting an empty-string placeholder — some
-    // strict clients (e.g. Grok Build's messages backend) reject `signature: ""`
-    // as a missing/invalid value. If upstream ever supplies a real signature we
-    // forward it (forward-compat for a future thinking/paid model).
+  if (choice?.message?.reasoning_content || choice?.message?.reasoning_signature) {
+    // Preserve real opaque signatures; omit the field for unsigned providers.
     const thinkingBlock = {
       type: 'thinking',
-      thinking: choice.message.reasoning_content,
+      thinking: choice.message.reasoning_content || '',
     };
     if (choice.message.reasoning_signature) {
       thinkingBlock.signature = choice.message.reasoning_signature;
@@ -986,12 +991,8 @@ class AnthropicStreamTranslator {
     // together or BUG1's guard stays defeated.
     this.sawSyntheticFinish = false;
     this.pendingSseBuf = '';
-    // Anthropic streams close a thinking block with a `signature_delta` carrying
-    // the encrypted-thinking signature. Our upstream never produces one, so we
-    // keep the pending signature empty and only emit the delta if a real
-    // `delta.reasoning_signature` arrives. An empty-string fallback is omitted
-    // because strict clients (e.g. Grok Build's messages backend) reject
-    // `signature: ""` as an invalid value.
+    // Accumulate signature deltas until their thinking block closes. The
+    // native adapter holds later content until the upstream signature is complete.
     this.pendingThinkingSignature = '';
   }
 
@@ -1227,10 +1228,18 @@ class AnthropicStreamTranslator {
         }
         this.emitThinkingDelta(delta.reasoning_content);
       }
-      // Forward-compat: if a future upstream attaches a real encrypted signature
-      // to the reasoning stream, capture it so closeCurrentBlock round-trips the
-      // genuine value instead of the empty-string placeholder.
-      if (delta.reasoning_signature) this.pendingThinkingSignature = delta.reasoning_signature;
+      // Only attach signatures to their still-open block; never silently
+      // manufacture a new block after its thinking has already been closed.
+      if (delta.reasoning_signature) {
+        if (this.current?.type !== 'thinking') {
+          if (this.current || this.blockIndex > 0) {
+            this.error({ type: 'api_error', message: 'Thinking signature arrived after its block closed.' });
+            return;
+          }
+          this.startBlock('thinking');
+        }
+        this.pendingThinkingSignature += delta.reasoning_signature;
+      }
       if (delta.content) {
         if (leakTraceEnabled()) {
           log.info('LEAK_TRACE classify', {

@@ -21,6 +21,7 @@
  *     so the next cascade turn can see them.
  */
 
+import { nativeThinkingEnabled } from '../devin-thinking.js';
 import { log } from '../config.js';
 
 // "<workspace>" you may see is a redaction marker, NOT a literal path.
@@ -1149,6 +1150,9 @@ export function interleaveParallelToolMessages(messages) {
   while (i < messages.length) {
     const m = messages[i];
     if (m?.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 1) {
+      // Preserve unsupported signed batches intact so attempt validation rejects
+      // them before transport, rather than splitting one signature across calls.
+      if (nativeThinkingEnabled() && (m.nativeThinkingBlocks?.some(b => b.signature) || m.reasoning_signature)) { out.push(m); i++; continue; }
       let j = i + 1;
       const toolMsgs = [];
       while (j < messages.length && messages[j]?.role === 'tool') {
@@ -1177,6 +1181,8 @@ export function interleaveParallelToolMessages(messages) {
           if (!first) {
             delete singleAssistant.reasoning_content;
             delete singleAssistant.reasoning;
+            delete singleAssistant.nativeThinkingBlocks;
+            delete singleAssistant.reasoning_signature;
           }
           out.push(singleAssistant);
 
@@ -1312,7 +1318,7 @@ export function normalizeMessagesForCascade(messages, tools, options = {}) {
     }
 
     if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-      if (nativeStructured) { out.push(m); continue; } // keep structured for native #6 encode
+      if (nativeStructured || (nativeThinkingEnabled() && (m.nativeThinkingBlocks?.length || m.reasoning_signature))) { out.push(m); continue; } // preserve metadata until attempt validation
       const parts = [];
       if (m.content) parts.push(typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
       // Serialize past tool_calls back into the cascade history using the

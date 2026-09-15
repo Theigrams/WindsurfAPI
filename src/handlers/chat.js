@@ -3,6 +3,7 @@
  * Routes to RawGetChatMessage (legacy) or Cascade (premium) based on model type.
  */
 
+import { nativeThinkingMode } from '../devin-thinking.js';
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
 import { getApiKey, acquireAccountByKey, releaseAccountById, currentApiKeyForId, getAccountAvailability, reportError, reportSuccess, markRateLimited, markQuotaExhausted, reportInternalError, reportDeadToken, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, isConnectSelectorBlockedByDrought, getDroughtSummary, reLoginAccount, getAccountCount, hasConnectEntitledAccount, recordAccountSpend, ensureDeviceSeed } from '../auth.js';
@@ -516,6 +517,7 @@ export function connectErrorToHttp(code) {
     // auth or account fault). 400 invalid_request_error is the honest surface — the
     // caller must change the prompt, not retry or re-auth. NO account penalty.
     case 'CONTENT_BLOCKED': return { status: 400, type: 'invalid_request_error' };
+    case 'NATIVE_THINKING_INCOMPATIBLE': return { status: 400, type: 'invalid_request_error' };
     case 'NO_TOKEN': return { status: 401, type: 'authentication_error' };
     case 'TIMEOUT': return { status: 504, type: 'timeout_error' };
     // Absolute wall-clock deadline (upstream hung the full window). Same 504
@@ -2386,7 +2388,7 @@ function isAbortError(err) {
 // classifyUpstreamError now claims it explicitly so it gets the UNAUTHORIZED arm's
 // re-login attempt rather than a bare eviction.
 const TRANSPORT_FAULT_CODES = new Set([
-  'TIMEOUT', 'DEADLINE_EXCEEDED', 'NO_TOKEN',
+  'TIMEOUT', 'DEADLINE_EXCEEDED', 'NO_TOKEN', 'NATIVE_THINKING_INCOMPATIBLE',
   'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH',
   'ENETUNREACH', 'EAI_AGAIN', 'ECONNABORTED',
   // Passed-through gRPC statuses: upstream load-shedding / stalls.
@@ -3336,6 +3338,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // silently falling back to prompt emulation.
     if (emulateTools) log.info(`Chat[${reqId}]: TOOLCALL nativeFlag=${nativeFlag} defsOn=${nativeDefsOn} callsOn=${nativeCallsOn} suppressPreamble=${suppressPreamble} mode=${(nativeDefsOn && nativeCallsOn) ? 'NATIVE' : 'emulation'}`);
     const nativeStructured = nativeDefsOn && nativeCallsOn;
+    if (nativeThinkingMode(selector) && emulateTools && !nativeStructured) {
+      return { status: 400, body: { error: { type: 'invalid_request_error', code: 'NATIVE_THINKING_INCOMPATIBLE', message: 'Native thinking requires native tool definitions and calls.' } } };
+    }
     let connectMessages = emulateTools
       ? normalizeMessagesForCascade(messages, connectTools, { modelKey: reqModelName, provider: null, route: 'devin_connect', toolChoice: tool_choice, injectUserPreamble: !suppressPreamble, stripOrphans: nativeDefsOn, nativeStructured })
       : interleaveParallelToolMessages(messages);
@@ -3474,7 +3479,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       }
     }
     const ccAcct = await acquireConnectAccount(context.signal, callerKey, selector);
-    const connectParams = { messages: connectMessages, model: selector };
+    const connectParams = { messages: connectMessages, model: selector, nativeThinkingScope: callerKey || '' };
     // Session continuity (opt-in, DEVIN_CONNECT_SESSION_REUSE, default OFF). Derive
     // a stable protobuf session_id (#16) from the conversation's completed request/
     // response pair chain so a multi-turn dialog reuses ONE session_id instead of
@@ -3505,7 +3510,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       const modelCfg = getSessionConnectModelConfig(callerKey || '', connectMessages, connectSessionEnv);
       if (modelCfg) connectParams.sessionModelConfig = { id: modelCfg.configId, turn: modelCfg.turn };
       const reasoningTrail = getSessionConnectReasoningTrail(callerKey || '', connectMessages, connectSessionEnv);
-      if (reasoningTrail) connectParams.continuityTrail = reasoningTrail;
+      if (reasoningTrail && !nativeThinkingMode(selector)) connectParams.continuityTrail = reasoningTrail;
       log.info(`Chat[${reqId}]: DEVIN_CONNECT session reuse active → session_id=${connectSessionId}${modelCfg ? ` model_config=stable config_id=${modelCfg.configId} turn=${modelCfg.turn}` : ''} acct=${ccAcct?.account?.id || 'env-token'}`);
     }
     if (ccAcct) {
