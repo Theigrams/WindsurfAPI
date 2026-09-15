@@ -15,7 +15,11 @@ const STATE_KEY = 'windsurfAuthStatus';
 const TMP_STATE_DIR_PREFIX = path.join(os.tmpdir(), 'windsurf-state-');
 const MAX_STATE_DB_BYTES = 24 * 1024 * 1024;
 const MAX_STATE_ROWS_PER_DB = 200;
-const MAX_STATE_VALUE_BYTES = 128 * 1024;
+// Per-value cap must clear real windsurfAuthStatus payloads: besides apiKey the
+// value embeds allowedCommandModelConfigs + userStatus protobufs as base64, and
+// live Devin-desktop captures measure ~160KB — a 128KB cap silently skips the
+// only row that holds the session token.
+const MAX_STATE_VALUE_BYTES = 512 * 1024;
 const DISCOVER_CACHE_TTL_MS = 4000;
 
 let cachedSqlite = undefined;
@@ -24,7 +28,10 @@ let discoverInFlight = null;
 
 export function getCandidateStateDbPaths() {
   const home = os.homedir();
-  const flavors = ['Windsurf', 'Windsurf - Next', 'Windsurf-Next', 'Windsurf Insiders'];
+  // 'Devin' first: the desktop app rebranded from Windsurf to Devin, and fresh
+  // installs only create the Devin data dir — the Windsurf flavors remain for
+  // legacy installs.
+  const flavors = ['Devin', 'Windsurf', 'Windsurf - Next', 'Windsurf-Next', 'Windsurf Insiders'];
   const paths = [];
   if (process.platform === 'darwin') {
     for (const f of flavors) {

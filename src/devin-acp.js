@@ -524,6 +524,12 @@ export async function runDevinAcpProcess(prompt, { modelKey = '', apiKey = '', a
   const command = process.env.DEVIN_CLI_PATH || 'devin';
   const env = { ...process.env };
   const args = parseAcpArgs();
+  // One channel only: `devin acp --model` (do not also set DEVIN_MODEL — the
+  // two can disagree). Leave DEVIN_PERMISSION_MODE to the operator; do not
+  // default it to auto.
+  if (modelKey && !args.includes('--model')) {
+    args.push('--model', modelKey);
+  }
   const client = makeAcpClient({
     command,
     args,
@@ -541,7 +547,7 @@ export async function runDevinAcpProcess(prompt, { modelKey = '', apiKey = '', a
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
       },
-      clientInfo: { name: 'WindsurfAPI', version: VERSION },
+      clientInfo: { name: process.env.DEVIN_ACP_CLIENT_NAME || 'WindsurfAPI', version: VERSION },
     }, 30_000);
     if (init.error) throw errorFromRpcResponse(init, 'Devin ACP initialize failed');
 

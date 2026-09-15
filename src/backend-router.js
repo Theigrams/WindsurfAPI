@@ -41,6 +41,21 @@ function isSpecialAgentInfo(modelInfo) {
   return modelInfo?.backend === 'special_agent';
 }
 
+function specialAgentEnabled(env = process.env) {
+  if (getBackendSwitch('devinOnly', env)) return true;
+  const backend = String(env?.WINDSURFAPI_SPECIAL_AGENT_BACKEND || '').trim().toLowerCase();
+  return backend === 'devin-cli' || env?.DEVIN_CLI_ENABLED === '1';
+}
+
+// Observed gpt-5.6 SKUs Cascade rejects with "This model is only in Devin Local".
+// Anchored to luna/sol/terra (+ effort / -priority). Do not prefix-match gpt-5.60.
+// swe-2* is catalogued as backend: 'special_agent' and is handled by that branch.
+const GPT56_LOCAL_SKU = /^(?:gpt-5[.-]6|gpt5[.-]6)-(luna|sol|terra)(?:-(none|low|medium|high|xhigh|max)(?:-priority)?)?$/;
+
+function isDevinLocalOnlyModel(modelInfo) {
+  return [modelInfo?.name, modelInfo?.modelUid].some((k) => GPT56_LOCAL_SKU.test(String(k || '').trim().toLowerCase()));
+}
+
 /**
  * Resolve the Devin CLI sub-mode (acp vs print). Defaults to print — the same
  * conservative default special-agent.js uses.
@@ -121,6 +136,14 @@ export function selectBackend({ modelInfo = null, env = process.env } = {}) {
     return {
       backend: devinCliMode(env),
       reason: 'modelInfo.backend=special_agent',
+      flow: 'special_agent',
+    };
+  }
+
+  if (specialAgentEnabled(env) && isDevinLocalOnlyModel(modelInfo)) {
+    return {
+      backend: devinCliMode(env),
+      reason: 'devin_local_only',
       flow: 'special_agent',
     };
   }

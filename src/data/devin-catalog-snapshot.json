@@ -1,7 +1,7 @@
 {
   "_comment": "DEVIN_CONNECT catalog whitelist. Refreshed from live GetCascadeModelConfigs 2026-07-08. Live dash-form + enum selectors; MODEL_PRIVATE_* excluded EXCEPT those referenced by SELECTOR_MAP; swe-1-6-slow free-tier fallback preserved. Extended 2026-08-11 from docs.devin.ai modelCostData (gpt-5-6-luna-*, claude-opus-5-*) — NOT yet frame-verified; selector form follows the 4-8/fable family convention.",
   "_calibratedAt": "2026-07-08",
-  "_count": 120,
+  "_count": 123,
   "models": [
     {
       "selector": "claude-opus-4-8-medium",
@@ -39,6 +39,19 @@
     },
     {
       "selector": "swe-1-7-lightning",
+      "provider": "cognition"
+    },
+    {
+      "selector": "swe-2-medium",
+      "provider": "cognition",
+      "alias": "swe-2"
+    },
+    {
+      "selector": "swe-2-high",
+      "provider": "cognition"
+    },
+    {
+      "selector": "swe-2-max",
       "provider": "cognition"
     },
     {

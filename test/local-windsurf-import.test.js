@@ -54,6 +54,7 @@ describe('getCandidateStateDbPaths', () => {
     const joined = paths.join('|');
     assert.ok(joined.includes('Windsurf'), 'should include base Windsurf path');
     assert.ok(joined.includes('Windsurf - Next') || joined.includes('Windsurf-Next'), 'should include Windsurf Next flavor');
+    assert.ok(joined.includes('Devin'), 'should include rebranded Devin flavor');
   });
 
   it('uses platform-appropriate base directories', () => {
@@ -137,6 +138,43 @@ describe('extractFromStateDb (fixture)', { skip: await sqliteUnavailable() }, ()
     const unique = new Set(keys);
     assert.equal(keys.length, unique.size, 'no duplicate apiKey across sources');
   });
+
+  it('imports a windsurfAuthStatus value above the old 128KB cap', async () => {
+    const { extractFromStateDb } = await import('../src/dashboard/local-windsurf.js');
+    const value = JSON.stringify({
+      apiKey: 'sk-ws-03-fixturekey-large160kbxx',
+      email: 'large@example.com',
+      name: 'Large',
+      padding: 'x'.repeat(160 * 1024),
+    });
+    assert.ok(value.length > 128 * 1024, `fixture must exceed 128KB, got ${value.length}`);
+    assert.ok(value.length <= 512 * 1024, `fixture must fit under 512KB, got ${value.length}`);
+    const fixturePath = await buildSizedFixtureDb('windsurfAuthStatus', value);
+    const r = await extractFromStateDb(fixturePath);
+    assert.equal(r.ok, true);
+    const acc = r.accounts.find(a => a.email === 'large@example.com');
+    assert.ok(acc, `160KB-class row must import, got ${r.accounts.length} accounts`);
+    assert.equal(acc.apiKey, 'sk-ws-03-fixturekey-large160kbxx');
+  });
+
+  it('skips a value above the 512KB cap', async () => {
+    const { extractFromStateDb } = await import('../src/dashboard/local-windsurf.js');
+    const value = JSON.stringify({
+      apiKey: 'sk-ws-04-fixturekey-oversize512kb',
+      email: 'toobig@example.com',
+      name: 'TooBig',
+      padding: 'x'.repeat(512 * 1024),
+    });
+    assert.ok(value.length > 512 * 1024, `oversize fixture must exceed 512KB, got ${value.length}`);
+    const fixturePath = await buildSizedFixtureDb('windsurfAuthStatus', value);
+    const r = await extractFromStateDb(fixturePath);
+    assert.equal(r.ok, true);
+    assert.equal(
+      r.accounts.find(a => a.email === 'toobig@example.com'),
+      undefined,
+      '512KB+1 row must be skipped',
+    );
+  });
 });
 
 async function sqliteUnavailable() {
@@ -167,6 +205,18 @@ async function buildFixtureDb() {
     account: { email: 'second@example.com', name: 'Second' },
   }]));
   stmt.run('something-else', 'unrelated value');
+  db.close();
+  return fixturePath;
+}
+
+async function buildSizedFixtureDb(key, value) {
+  const sqlite = await import('node:sqlite');
+  const fsMod = await import('node:fs');
+  const fixturePath = path.join(os.tmpdir(), `fixture-windsurf-state-size-${process.pid}-${Date.now()}.vscdb`);
+  try { fsMod.unlinkSync(fixturePath); } catch {}
+  const db = new sqlite.DatabaseSync(fixturePath);
+  db.exec('CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT)');
+  db.prepare('INSERT INTO ItemTable (key, value) VALUES (?, ?)').run(key, value);
   db.close();
   return fixturePath;
 }

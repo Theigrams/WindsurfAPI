@@ -33,6 +33,68 @@ describe('backend-router selectBackend — behaviour parity with legacy', () => 
     assert.ok(usesCascadeFlow(sel));
   });
 
+  it('gpt-5.6 stays on cascade unless Devin CLI special-agent is enabled', () => {
+    const sel = selectBackend({
+      modelInfo: { name: 'gpt-5.6-luna', modelUid: 'gpt-5-6-luna-medium' },
+      env: {},
+    });
+    assert.equal(sel.flow, 'cascade');
+  });
+
+  it('gpt-5.6-luna → ACP when DEVIN_CLI_ENABLED=1 and DEVIN_CLI_MODE=acp', () => {
+    const sel = selectBackend({
+      modelInfo: { name: 'gpt-5.6-luna', modelUid: 'gpt-5-6-luna-medium' },
+      env: { DEVIN_CLI_ENABLED: '1', DEVIN_CLI_MODE: 'acp' },
+    });
+    assert.equal(sel.backend, BACKEND.DEVIN_ACP);
+    assert.equal(sel.flow, 'special_agent');
+    assert.equal(sel.reason, 'devin_local_only');
+  });
+
+  it('gpt-5.6-luna → print when CLI is on but mode is not acp', () => {
+    const sel = selectBackend({
+      modelInfo: { name: 'gpt-5.6-luna', modelUid: 'gpt-5-6-luna-medium' },
+      env: { DEVIN_CLI_ENABLED: '1' },
+    });
+    assert.equal(sel.backend, BACKEND.DEVIN_PRINT);
+    assert.equal(sel.reason, 'devin_local_only');
+  });
+
+  it('does not treat gpt-5.60 as a Devin Local gpt-5.6 SKU', () => {
+    const env = { DEVIN_CLI_ENABLED: '1', DEVIN_CLI_MODE: 'acp' };
+    // No uid: hijack would be special_agent / devin_local_only.
+    const noUid = selectBackend({ modelInfo: { name: 'gpt-5.60' }, env });
+    assert.equal(noUid.flow, 'legacy');
+    assert.notEqual(noUid.reason, 'devin_local_only');
+    // With uid the fall-through is cascade, still not the local-only branch.
+    const withUid = selectBackend({
+      modelInfo: { name: 'gpt-5.60', modelUid: 'gpt-5-60' },
+      env,
+    });
+    assert.equal(withUid.flow, 'cascade');
+    assert.equal(withUid.reason, 'modelUid');
+    assert.notEqual(withUid.reason, 'devin_local_only');
+  });
+
+  it('swe-2 catalog entries use backend=special_agent (not the gpt-5.6 local-only branch)', () => {
+    const sel = selectBackend({
+      modelInfo: { name: 'swe-2-medium', modelUid: 'swe-2-medium', backend: 'special_agent' },
+      env: { DEVIN_CLI_ENABLED: '1', DEVIN_CLI_MODE: 'acp' },
+    });
+    assert.equal(sel.backend, BACKEND.DEVIN_ACP);
+    assert.equal(sel.flow, 'special_agent');
+    assert.equal(sel.reason, 'modelInfo.backend=special_agent');
+  });
+
+  it('DEVIN_CONNECT=1 still wins over swe-2 special_agent', () => {
+    const sel = selectBackend({
+      modelInfo: { name: 'swe-2-medium', modelUid: 'swe-2-medium', backend: 'special_agent' },
+      env: { DEVIN_CONNECT: '1', DEVIN_CLI_ENABLED: '1', DEVIN_CLI_MODE: 'acp' },
+    });
+    assert.equal(sel.backend, BACKEND.DEVIN_CONNECT);
+    assert.equal(sel.reason, 'devin_connect');
+  });
+
   it('enumValue > 0 (no uid) → cascade', () => {
     const sel = selectBackend({ modelInfo: { enumValue: 166 }, env: {} });
     assert.equal(sel.backend, BACKEND.CASCADE);

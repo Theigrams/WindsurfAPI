@@ -38,9 +38,19 @@ function normalizeMessageContent(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return stringifyMaybe(content);
 
+  const hasContentBlock = content.some(part => part && typeof part === 'object' && typeof part.type === 'string');
+  if (!hasContentBlock) {
+    return stringifyMaybe(content);
+  }
+
   const out = [];
   for (const part of content) {
-    if (!part || typeof part !== 'object') continue;
+    if (!part) continue;
+    if (typeof part === 'string') {
+      out.push({ type: 'text', text: part });
+      continue;
+    }
+    if (typeof part !== 'object') continue;
     if (part.type === 'input_text' || part.type === 'output_text' || part.type === 'text') {
       out.push({ type: 'text', text: part.text || '' });
     } else if (part.type === 'input_image') {
@@ -423,7 +433,7 @@ export function responsesToChat(body) {
         messages.push({
           role: 'tool',
           tool_call_id: item.call_id || item.id,
-          content: stringifyMaybe(item.output ?? ''),
+          content: normalizeMessageContent(item.output ?? ''),
         });
       } else if (item.type === 'custom_tool_call') {
         flushToolCalls.add({
@@ -437,7 +447,7 @@ export function responsesToChat(body) {
         messages.push({
           role: 'tool',
           tool_call_id: item.call_id || item.id,
-          content: stringifyMaybe(item.output ?? ''),
+          content: normalizeMessageContent(item.output ?? ''),
         });
       }
     }

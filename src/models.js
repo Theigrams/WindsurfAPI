@@ -280,6 +280,13 @@ export const MODELS = {
   // (dash-form modelUid, no special_agent backend — resolved via catalog, not LS).
   'swe-1-7':                        { name: 'swe-1-7',                        provider: 'windsurf', enumValue: 0, modelUid: 'swe-1-7', credit: 0.5 },
   'swe-1-7-lightning':              { name: 'swe-1-7-lightning',              provider: 'windsurf', enumValue: 0, modelUid: 'swe-1-7-lightning', credit: 0.5 },
+  // SWE-2 — Cognition 2026-09-10 (docs.devin.ai: swe-2-medium/high/max).
+  // DEVIN_CONNECT=1 uses the snapshot selectors. Cascade has no UID, so the
+  // LS path marks them special_agent (same as swe-1.6) for an opted-in CLI.
+  'swe-2':                          { name: 'swe-2',                          provider: 'windsurf', enumValue: 0, modelUid: 'swe-2-medium', credit: 6, backend: 'special_agent' },
+  'swe-2-medium':                   { name: 'swe-2-medium',                   provider: 'windsurf', enumValue: 0, modelUid: 'swe-2-medium', credit: 6, backend: 'special_agent' },
+  'swe-2-high':                     { name: 'swe-2-high',                     provider: 'windsurf', enumValue: 0, modelUid: 'swe-2-high', credit: 9, backend: 'special_agent' },
+  'swe-2-max':                      { name: 'swe-2-max',                      provider: 'windsurf', enumValue: 0, modelUid: 'swe-2-max', credit: 12, backend: 'special_agent' },
 
   // ── Adaptive (Windsurf 2026-04-06 changelog) ────────────
   // Adaptive Model Router + Arena models live in the cloud catalog but their
@@ -385,6 +392,12 @@ _lookup.set('gpt-5-3-codex-xhigh-priority', 'gpt-5.3-codex-xhigh-fast');
 // Cloud-format aliases for existing dotted names
 _lookup.set('swe-1-6', 'swe-1.6');
 _lookup.set('swe-1-6-fast', 'swe-1.6-fast');
+_lookup.set('swe-2.0', 'swe-2');
+_lookup.set('swe-2-0', 'swe-2');
+_lookup.set('swe2', 'swe-2');
+_lookup.set('swe-2.0-medium', 'swe-2-medium');
+_lookup.set('swe-2.0-high', 'swe-2-high');
+_lookup.set('swe-2.0-max', 'swe-2-max');
 _lookup.set('minimax-m2-5', 'minimax-m2.5');
 _lookup.set('kimi-k2-5', 'kimi-k2.5');
 _lookup.set('kimi-k2.6', 'kimi-k2-6');

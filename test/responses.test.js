@@ -958,4 +958,59 @@ describe('H-1 (audit 2026-07-13): input_image string image_url normalizes to obj
     assert.equal(imgs[0].image_url.detail, 'high');
     assert.equal(imgs[1].image_url.url, 'https://z/w.png');
   });
+
+  it('normalizes multimodal function_call_output and custom_tool_call_output items', () => {
+    const { messages } = responsesToChat({
+      model: 'gpt-4o',
+      input: [
+        {
+          type: 'function_call_output',
+          call_id: 'call_img',
+          output: [
+            { type: 'input_text', text: 'Screenshot captured' },
+            { type: 'input_image', image_url: 'data:image/jpeg;base64,12345' },
+          ],
+        },
+        {
+          type: 'custom_tool_call_output',
+          call_id: 'call_custom_img',
+          output: [
+            { type: 'input_image', image_url: 'https://example.com/test.png' },
+          ],
+        },
+      ],
+    });
+    assert.equal(messages.length, 2);
+    assert.equal(messages[0].role, 'tool');
+    assert.equal(messages[0].tool_call_id, 'call_img');
+    assert.deepEqual(messages[0].content, [
+      { type: 'text', text: 'Screenshot captured' },
+      { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,12345' } },
+    ]);
+    assert.equal(messages[1].role, 'tool');
+    assert.equal(messages[1].tool_call_id, 'call_custom_img');
+    assert.deepEqual(messages[1].content, [
+      { type: 'image_url', image_url: { url: 'https://example.com/test.png' } },
+    ]);
+  });
+
+  it('preserves non-content array tool outputs as JSON string', () => {
+    const { messages } = responsesToChat({
+      model: 'gpt-4o',
+      input: [
+        {
+          type: 'function_call_output',
+          call_id: 'call_list',
+          output: ['file1.txt', 'file2.txt'],
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_objects',
+          output: [{ name: 'alice' }, { name: 'bob' }],
+        },
+      ],
+    });
+    assert.equal(messages[0].content, JSON.stringify(['file1.txt', 'file2.txt']));
+    assert.equal(messages[1].content, JSON.stringify([{ name: 'alice' }, { name: 'bob' }]));
+  });
 });

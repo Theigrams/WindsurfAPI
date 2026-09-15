@@ -121,6 +121,16 @@ const SELECTOR_MAP = new Map(Object.entries({
   'swe-1.7': 'swe-1-7',
   'swe-1-7-lightning': 'swe-1-7-lightning',
   'swe-1.7-lightning': 'swe-1-7-lightning',
+  'swe-2': 'swe-2-medium',
+  'swe-2.0': 'swe-2-medium',
+  'swe-2-0': 'swe-2-medium',
+  'swe2': 'swe-2-medium',
+  'swe-2-medium': 'swe-2-medium',
+  'swe-2-high': 'swe-2-high',
+  'swe-2-max': 'swe-2-max',
+  'swe-2.0-medium': 'swe-2-medium',
+  'swe-2.0-high': 'swe-2-high',
+  'swe-2.0-max': 'swe-2-max',
   'deepseek-v4': 'deepseek-v4',
 
   // GPT-5.6 family (live catalog 2026-07-09, docs.devin.ai price table). Luna is

@@ -1,6 +1,12 @@
 # Local deployment patches
 
-Base: upstream v3.9.33, commit `938a57e44806dbecd93b51d330c0572f01edf662`.
+Base: upstream v3.9.34, commit `0c08524` (merged 2026-09-16).
+
+The v3.9.34 merge retains the patches below. Upstream now merges adjacent
+same-role text before Connect encoding and preserves Responses tool-output
+images. The latter fixes `/v1/responses`; the local Anthropic image patch is
+still required for `/v1/messages`. The local cache accounting and model-scoped
+continuity files have no upstream changes in this release.
 
 This checkout retains two deployed behavior fixes in `src/handlers/messages.js`:
 
@@ -30,7 +36,10 @@ node --import ./test/setup-env.mjs --test \
   test/devin-connect-tool-history.test.js \
   test/messages-cache-accounting.test.js \
   test/messages-tool-images.test.js \
-  test/cache-control.test.js test/messages.test.js test/tool-emulation.test.js
+  test/cache-control.test.js test/messages.test.js test/tool-emulation.test.js \
+  test/session-continuity.test.js test/devin-connect.test.js \
+  test/responses.test.js test/backend-router.test.js \
+  test/devin-connect-models.test.js test/local-windsurf-import.test.js
 ```
 
 The local continuity selector allowlist adds `DEVIN_CONNECT_SESSION_MODELS`.

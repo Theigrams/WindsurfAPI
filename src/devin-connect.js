@@ -1036,7 +1036,48 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
     return text ? `${wrapped}\n${text}` : wrapped;
   };
 
-  for (const msg of messages || []) {
+  // Coalesce consecutive same-source text-only turns before wire encoding.
+  // Clients that persist streamed output per-part (an agent that splits one
+  // turn into several stored entries) emit runs of consecutive same-role
+  // text messages — e.g. [assistant,assistant,assistant]. The upstream
+  // request validator rejects a same-source run of length >= 3 with
+  // invalid_argument ("an internal error occurred") — a run of 2 is
+  // tolerated (verified by wire-shape comparison, PR #267 review): the
+  // request decodes and begins processing, then the trailer fails. Merging
+  // keeps the text identical while shrinking the run below the threshold.
+  // Text-only guard: never merge entries carrying tool_calls/tool_call_id,
+  // reasoning payloads, or non-text content parts (images) — those encode to
+  // distinct wire types and must stay separate.
+  const isMergeableText = (m) => {
+    if (!m || (m.role !== 'user' && m.role !== 'assistant')) return false;
+    if (m.tool_calls?.length || m.tool_call_id) return false;
+    if (m.reasoning || m.reasoning_content) return false;
+    if (Array.isArray(m.content)) return m.content.every((c) => c?.type === 'text');
+    return true;
+  };
+  const mergedMessages = [];
+  for (const m of messages || []) {
+    // Default: system turns hoist to field #2 and vanish from the chat
+    // sequence, so look past them when judging same-source adjacency.
+    // COLLAPSE_SYSTEM=1 keeps them in the sequence (wrapped into the next
+    // user), so they break adjacency the same way a real turn does — looking
+    // past them would merge the surrounding users and squeeze the system
+    // out of its injection slot.
+    let pi = mergedMessages.length - 1;
+    while (pi >= 0 && mergedMessages[pi].role === 'system' && !collapseSystem) pi--;
+    const prev = pi >= 0 ? mergedMessages[pi] : null;
+    if (prev && prev.role === m.role && isMergeableText(prev) && isMergeableText(m)) {
+      const a = messageText(prev.content);
+      const b = messageText(m.content);
+      // Fresh object, never mutate caller state — the same `messages` array is
+      // re-passed on retry/failover and an in-place merge would double-append.
+      mergedMessages[pi] = { ...prev, content: b ? (a ? `${a}\n\n${b}` : b) : a };
+      continue;
+    }
+    mergedMessages.push(m);
+  }
+
+  for (const msg of mergedMessages) {
     if (msg.role === 'system') {
       const t = messageText(msg.content);
       if (collapseSystem) {

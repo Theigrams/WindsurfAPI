@@ -23,6 +23,26 @@ describe('resolveConnectSelector', () => {
     assert.deepEqual(resolveConnectSelector('swe-1.6-slow'), { selector: 'swe-1-6-slow', mapped: true });
   });
 
+  it('maps swe-2 _lookup aliases onto catalog selectors', () => {
+    // Same names models.js _lookup accepts. Without these SELECTOR_MAP rows,
+    // DEVIN_CONNECT=1 + STRICT_MODEL=1 400s them even though resolveModel succeeds.
+    const cases = [
+      ['swe-2', 'swe-2-medium'],
+      ['swe-2.0', 'swe-2-medium'],
+      ['swe-2-0', 'swe-2-medium'],
+      ['swe2', 'swe-2-medium'],
+      ['swe-2-medium', 'swe-2-medium'],
+      ['swe-2-high', 'swe-2-high'],
+      ['swe-2-max', 'swe-2-max'],
+      ['swe-2.0-medium', 'swe-2-medium'],
+      ['swe-2.0-high', 'swe-2-high'],
+      ['swe-2.0-max', 'swe-2-max'],
+    ];
+    for (const [name, selector] of cases) {
+      assert.deepEqual(resolveConnectSelector(name), { selector, mapped: true }, name);
+    }
+  });
+
   it('maps claude friendly names to their captured upstream selectors', () => {
     assert.equal(resolveConnectSelector('claude-opus-4.8').selector, 'claude-opus-4-8-medium');
     // Dashed bare form is a real catalog selector (base model) → resolves to itself;

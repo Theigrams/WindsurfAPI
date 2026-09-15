@@ -242,6 +242,8 @@ describe('ToolCallStreamParser', () => {
     assert.equal(pickToolDialect('swe-1-6-slow'), 'openai_json_xml');
     assert.equal(pickToolDialect('swe-1-8'), 'openai_json_xml');
     assert.equal(pickToolDialect('swe-2-0'), 'openai_json_xml');
+    assert.equal(pickToolDialect('swe-2'), 'openai_json_xml');
+    assert.equal(pickToolDialect('swe-2-medium'), 'openai_json_xml');
     assert.equal(pickToolDialect('swe-1-7-future-slow'), 'openai_json_xml');
   });
 

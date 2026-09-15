@@ -530,6 +530,56 @@
       "mergedAt": "2026-08-09",
       "title": "feat(session-continuity): survive single-dialog history compaction — root-anchor fallback",
       "summary": "kimi 之类的客户端会在长对话里压缩历史:0/31 保留的 pair 逐字或规范都存活不下来,客户端改写保留尾 —— 但对话的第一轮输入逐字存活。这个 PR 用 root anchor(首轮输入哈希)索引每个 state,compaction 之后 pair 证据全丢时,通过 root 重新关联。三条防线:root-index the fork(分叉共享开端的 root,避免压缩后被并回原会话的 hijack)、模糊规则(多个活跃候选无 pair 证据 → 不分配给任何,生成新 id)、TTL 驱逐(过期 state 不通过压缩复活)。guard 只在「没有任何入站哈希命中索引」时走 root(seen 为空)—— 前缀 pair 仍命中的分叉对话不得被 root 重关联。新增 spec session-continuity-compaction-survival.json 3 条突变全 CAUGHT。未到 S 是因为「survive client history compaction」只在单对话成立,而 PR 描述说成通用能力;另外与 #242 的 findExistingState 抽取有结构性交互(git 三方合并看不见,合并时实测 15 条测试失败后修复),说明拆函数抽局部这类重构跨 PR 叠加时风险在文本层之下。"
+    },
+    {
+      "login": "lovedxc",
+      "githubId": 138214841,
+      "pr": 270,
+      "weight": "A",
+      "weightLabel": "连续同 role 纯文本在 wire 前合并 · 从 #267 拆出并钉住 source 序列",
+      "mergedAt": "2026-09-14",
+      "title": "fix(devin-connect): merge consecutive same-role text turns before wire encoding",
+      "summary": "客户端把一个回合按 part 拆存时,历史里出现连续同 role 纯文本;原样编码后 wire 上连续同源 ChatMessage,run 长度 ≥ 3 时上游 invalid_argument。#267 把这件事和 uncaptured 的 repeated-#6 绑在一起,零测试,被回绝当前形态;作者按评审把 mergedMessages 那半单独提到本 PR,并补四条 wire 级断言(正向塌缩 / tool_calls·tool_call_id·reasoning 不合并 / system 对相邻透明 / 不改调用方数组)。只合并 user/assistant 纯文本,带 tool_calls / tool_call_id / reasoning / 非 text content 的条目明确排除,生成新对象不改调用方数组(重试/failover 会复用同一 messages)。实测:devin-connect.test.js 185/185;对抗 9/9(image_url 数组不合并、CJK+ZWJ 码点保留、空+文本不被 empty-drop 吃掉、mixed text+image 不吞后续文本);Linux CI 6/6(run 34799913540)。无突变规格钉住这段循环,守卫就是这四条 wire 断言。未到 S 是因为 run≥3 的机制是评审钉的,本 PR 是被邀请的那一半实现,且没有 mutation spec。"
+    },
+    {
+      "login": "justhil",
+      "githubId": 138752349,
+      "pr": 261,
+      "weight": "A",
+      "weightLabel": "并行 tool_calls 与结果交错 · native 历史不再打成连续同源",
+      "mergedAt": "2026-09-13",
+      "title": "fix(tools): interleave parallel tool calls with results to prevent upstream internal error",
+      "summary": "nativeStructured 路径上,一条 assistant 带多个 tool_calls 再跟多条 tool 结果,编码成连续 ASSISTANT-source,run≥3 时上游 UPSTREAM_INTERNAL。修在消息层:interleaveParallelToolMessages 把并行调用拆成交替的单调用序列。Rostopher 用真实 58KB 请求体二分回放(未打补丁 529 / 打补丁 200)。维护方补了承重测试,钉住 native 接缝的 wire 形状(text+2/4/2/4 而不是 2/2/4/4)。函数只在 tool_calls.length>1 时动作,幂等,不污染 session 指纹。未到 S 是因为作者原测试只覆盖 JS 形状,wire 级断言是合并时维护方补的。"
+    },
+    {
+      "login": "justhil",
+      "githubId": 138752349,
+      "pr": 265,
+      "weight": "S",
+      "weightLabel": "Responses 多模态工具输出 + nginx 1m 真缺陷,两轮改到实测边界",
+      "mergedAt": "2026-09-14",
+      "title": "fix(responses): normalize multimodal content in tool call output items",
+      "summary": "function_call_output / custom_tool_call_output 的数组 output 原先 stringifyMaybe 成扁平文本,Connect 路径上 data-URL 图进不了 #10 images。normalizeMessageContent 让带 type 的 content block 走既有 H-1 归一化,无 type 的数组回退 stringifyMaybe。下游核过:devin-connect 对 role:tool 调 extractInlineImages,默认 tag 10,图真的进通道。配套 nginx.conf:compose 里 :ro 挂载且 nginx 是唯一前置跳数,默认 client_max_body_size 1m,>1MB 多模态必然 413。两轮评审:超时从与 DEVIN_TIMEOUT_MS 默认 600s 对齐改成 900s(严格大于应用层,注释写成不变式);100m 收紧到 32m;真上限是 server.js MAX_BODY_SIZE=10MB,nginx 只需 ≥10m,15–25MB 过不去是应用层挡的。描述写清只修 Connect,Cascade 仍 JSON.stringify。responses.test.js 40/40;Linux CI 6/6(run 34790142853)。合并时按实测把 4 个覆盖 responses.test.js 的突变基线各 +2(47→49 / 44→46 / 57→59 / 42→44)。"
+    },
+    {
+      "login": "Jakevin",
+      "githubId": 4224127,
+      "pr": 266,
+      "weight": "A",
+      "weightLabel": "swe-2 进 Connect 目录 + gpt-5.6 Devin Local 显式 opt-in,两轮把默认放行拆掉",
+      "mergedAt": "2026-09-14",
+      "title": "feat(models,devin-acp): add swe-2 + route Devin Local-only models through ACP",
+      "summary": "SWE-2 medium/high/max 按 docs.devin.ai credit 6/9/12 进 MODELS 和 Connect 快照;Cascade/LS 无 UID 所以标 special_agent(与 swe-1.6 同族)。gpt-5.6 luna/sol/terra 仅在 DEVIN_CLI_ENABLED=1 时走 Devin Local。初版把 api_server_url 改成无 server 就发公共端点、正则劫持 gpt-5.60、DEVIN_PERMISSION_MODE=auto 兜底、clientInfo 默认冒充 windsurf,全量还多红 1 条。两轮改到位:authenticate 没有 server 就不声明;swe-2 走 special_agent 短路而不是死代码分支;DEVIN_CONNECT=1 赢过 CLI;只发 --model 不再写 DEVIN_MODEL;正则锚定 SKU;默认回 WindsurfAPI,冒充改成 DEVIN_ACP_CLIENT_NAME opt-in。N1 把 SELECTOR_MAP 补齐 swe-2-0/swe2/swe-2.0-{medium,high,max},Connect 面不再 400/静默降到 swe-1-6-slow。FREE_TIER/FREE_REACHABLE 仍是 swe-1-6-slow,没写 swe-1-7。实测:N1 十个名字 mapped:true;gpt-5.60 不走 devin_local_only;点名 5 个文件 374/374;Linux CI 6/6(run 34801058584)。未到 S 是因为本机没有 Devin CLI/live 账号,devin acp --model 对这些 key 的真实接受度和 Connect 面上 swe-2 可达性未验证;方言保持 openai_json_xml,没有 live tool-call 原文就不写 kimi_k2。"
+    },
+    {
+      "login": "Rostopher",
+      "githubId": 79308382,
+      "pr": 264,
+      "weight": "B+",
+      "weightLabel": "本地导入补 Devin 桌面目录 + 把 128KB 静默跳过抬到 512KB",
+      "mergedAt": "2026-09-14",
+      "title": "fix(dashboard): local import misses Devin-desktop logins — add Devin flavor + lift 128KB value cap",
+      "summary": "桌面端重品牌后 userData 在 `%APPDATA%\\Devin` / `~/Library/Application Support/Devin`,flavors 原先只有 Windsurf* 会 not_found。作者用四个 not_found 定位到目录名,再量 payload 发现 windsurfAuthStatus 约 160KB 被 128KB 上限静默跳过——第二个原因不是从第一个顺推的。flavors 把 `Devin` 放首位;上限 128KB→512KB,DB 级仍 24MB。官方文档桌面三端都是大写 `Devin`,CLI 是小写 `devin`,两处不该合成一个常量。维护方补了 160KB 能导入、512KB+1 仍跳过的 sqlite 样例,把这条上限钉住。CI 6/6(run 34703784933)。"
     }
   ]
 }

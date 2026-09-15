@@ -276,6 +276,90 @@ describe('buildGetChatMessageRequest', () => {
     assert.match(text, /42/);
   });
 
+  // Same-source text runs: a client history that splits one turn into several
+  // same-role entries produces consecutive same-source ChatMessages on the wire,
+  // and the upstream validator rejects a run of length >= 3 with
+  // invalid_argument. The builder merges text-only same-role runs before
+  // encoding; structured entries (tool_calls / tool_call_id / reasoning /
+  // images) are never merged.
+  it('merges a consecutive same-role text-only run into one ChatMessage', () => {
+    const proto = buildGetChatMessageRequest({
+      token: TOKEN,
+      model: 'm',
+      messages: [
+        { role: 'user', content: 'q1' },
+        { role: 'assistant', content: 'a1' },
+        { role: 'assistant', content: 'a2' },
+        { role: 'assistant', content: 'a3' },
+        { role: 'user', content: 'q2' },
+        { role: 'user', content: 'q2b' },
+      ],
+    });
+    const chats = getAllFields(parseFields(proto), 3).filter((f) => f.wireType === 2);
+    const sources = chats.map((c) => getField(parseFields(c.value), 2, 0).value);
+    // 6 text entries -> 3 wire turns; no same-source run survives.
+    assert.deepEqual(sources, [__testing.SOURCE.USER, __testing.SOURCE.ASSISTANT, __testing.SOURCE.USER]);
+    const merged = getField(parseFields(chats[1].value), 3, 2).value.toString('utf8');
+    assert.equal(merged, 'a1\n\na2\n\na3');
+  });
+
+  it('never merges entries carrying tool_calls / tool_call_id / reasoning', () => {
+    const proto = buildGetChatMessageRequest({
+      token: TOKEN,
+      model: 'm',
+      nativeToolCall: true,
+      env: { DEVIN_CONNECT_REPLAY_REASONING: '1' },
+      messages: [
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'bash', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'call_1', content: 'done' },
+        { role: 'assistant', content: 'a3', reasoning: 'r3' },
+        { role: 'assistant', content: 'a4' },
+      ],
+    });
+    const chats = getAllFields(parseFields(proto), 3).filter((f) => f.wireType === 2);
+    const sources = chats.map((c) => getField(parseFields(c.value), 2, 0).value);
+    // The tool_call entry, the tool result, and the reasoning entry are all
+    // non-mergeable — 'a4' is mergeable but its neighbour ('a3', reasoning)
+    // is not, so nothing collapses.
+    assert.deepEqual(sources, [
+      __testing.SOURCE.ASSISTANT, __testing.SOURCE.TOOL_RESULT,
+      __testing.SOURCE.ASSISTANT, __testing.SOURCE.ASSISTANT,
+    ]);
+    assert.ok(getField(parseFields(chats[0].value), 6, 2), 'tool_call entry keeps #6');
+    assert.ok(getField(parseFields(chats[1].value), 7, 2), 'tool result keeps #7 tool_call_id');
+    assert.ok(getField(parseFields(chats[2].value), 11, 2), 'reasoning entry keeps #11');
+    assert.equal(getField(parseFields(chats[3].value), 3, 2).value.toString('utf8'), 'a4', 'a4 stays its own turn');
+  });
+
+  it('looks past system turns when judging same-source adjacency', () => {
+    const proto = buildGetChatMessageRequest({
+      token: TOKEN,
+      model: 'm',
+      messages: [
+        { role: 'assistant', content: 'a1' },
+        { role: 'system', content: 'mid-conversation system' },
+        { role: 'assistant', content: 'a2' },
+        { role: 'user', content: 'q' },
+      ],
+    });
+    const chats = getAllFields(parseFields(proto), 3).filter((f) => f.wireType === 2);
+    const sources = chats.map((c) => getField(parseFields(c.value), 2, 0).value);
+    // system hoists to #2, so the two assistant texts are wire-adjacent and merge.
+    assert.deepEqual(sources, [__testing.SOURCE.ASSISTANT, __testing.SOURCE.USER]);
+    assert.equal(getField(parseFields(chats[0].value), 3, 2).value.toString('utf8'), 'a1\n\na2');
+  });
+
+  it('does not mutate the caller messages array', () => {
+    const messages = [
+      { role: 'user', content: 'q1' },
+      { role: 'user', content: 'q2' },
+    ];
+    buildGetChatMessageRequest({ token: TOKEN, model: 'm', messages });
+    assert.equal(messages.length, 2);
+    assert.equal(messages[0].content, 'q1');
+    assert.equal(messages[1].content, 'q2');
+  });
+
   it('drops empty assistant turns without tool_calls but keeps ones with tool_calls', () => {
     const proto = buildGetChatMessageRequest({
       token: TOKEN,
@@ -1269,6 +1353,23 @@ describe('buildGetChatMessageRequest — collapse system messages', () => {
     assert.equal(textOf(messages[0]), 'old answer');
     assert.equal(roleOf(messages[1]), 1);
     assert.equal(textOf(messages[1]), '<system>\nFOR NEXT USER\n</system>\nnew question');
+  });
+
+  it('does not merge users across a mid-conversation system when collapse is on', () => {
+    const proto = buildGetChatMessageRequest({
+      token: TOKEN,
+      model: 'm',
+      messages: [
+        { role: 'user', content: 'q1' },
+        { role: 'system', content: 'MID' },
+        { role: 'user', content: 'q2' },
+      ],
+      env: { DEVIN_CONNECT_COLLAPSE_SYSTEM: '1' },
+    });
+    assert.deepEqual(cmsOf(proto).map(textOf), [
+      'q1',
+      '<system>\nMID\n</system>\nq2',
+    ]);
   });
 
   it('trailing system content becomes a final synthetic user turn', () => {
