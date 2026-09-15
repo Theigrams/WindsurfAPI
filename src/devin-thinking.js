@@ -24,6 +24,46 @@ function blocksFor(message) {
   }
   return [];
 }
+export function hasSignedThinking(message) {
+  return message?.role === 'assistant' && blocksFor(message).some(b => b?.signature);
+}
+function validateParallelCallIds(calls) {
+  const ids = calls.map(tc => tc?.id);
+  if (ids.some(id => typeof id !== 'string' || !id) || new Set(ids).size !== ids.length) {
+    throw thinkingError('parallel tool calls require nonempty, unique tool-call IDs.');
+  }
+  return ids;
+}
+
+// A signed assistant turn is one protocol message: repeated #6 tool calls share
+// ONE #11 summary / #12 signature / #18 type. Never clone its signature onto
+// the legacy call/result interleaving path. Only reorder adjacent results by ID.
+// Validate before orphan stripping so malformed signed batches cannot be silently
+// rewritten into apparently valid history. Also used by the direct wire API.
+export function normalizeSignedToolHistory(messages) {
+  const out = [];
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    out.push(m);
+    if (!hasSignedThinking(m) || !(m.tool_calls?.length > 1)) continue;
+    const ids = validateParallelCallIds(m.tool_calls);
+    const results = new Map();
+    let j = i + 1;
+    while (j < messages.length && messages[j]?.role === 'tool') {
+      const result = messages[j++];
+      if (!ids.includes(result.tool_call_id) || results.has(result.tool_call_id)) {
+        throw thinkingError('signed tool results must reference each parallel tool-call ID exactly once.');
+      }
+      results.set(result.tool_call_id, result);
+    }
+    if (results.size !== ids.length) {
+      throw thinkingError('signed parallel tool history requires all results before the next conversation turn.');
+    }
+    out.push(...ids.map(id => results.get(id)));
+    i = j - 1;
+  }
+  return out;
+}
 function origin(params) {
   // A token rotation is conservatively treated as an account boundary.
   if (!params.token || !params.sessionId || typeof params.nativeThinkingScope !== 'string') {
@@ -61,7 +101,7 @@ export function prepareNativeThinking(params, now = Date.now()) {
   if (params.continuityTrail) throw thinkingError('native replay cannot be combined with reasoning prompt injection.');
   const scope = mode === 'signed' ? origin(params) : null;
   prune(now);
-  const normalized = messages.map(m => {
+  const normalized = normalizeSignedToolHistory(messages).map(m => {
     const blocks = blocksFor(m);
     if (!blocks.length) return m;
     if (m.role !== 'assistant' || blocks.length !== 1 || blocks[0]?.type !== 'thinking') {
@@ -76,7 +116,6 @@ export function prepareNativeThinking(params, now = Date.now()) {
     const copy = { type: 'thinking', thinking: block.thinking };
     if (block.signature) {
       if (mode !== 'signed') throw thinkingError('signed history cannot be replayed by an unsigned model.');
-      if (m.tool_calls?.length > 1) throw thinkingError('signed parallel tool history is not yet supported.');
       const record = issued.get(keyFor(scope, block.thinking, block.signature));
       if (!record) throw thinkingError('signature origin is unknown, expired, or differs in thinking/model/account/session.');
       copy.signature = block.signature;
@@ -133,7 +172,7 @@ export async function* nativeThinkingEvents(source, params, now = () => Date.now
   if (params.signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError', code: 'ABORT_ERR' });
   if (signature) {
     if (mode !== 'signed' || !type) throw thinkingError('signature has no verified upstream type.');
-    if (finish.toolCalls?.length > 1) throw thinkingError('signed parallel tool responses are not yet supported.');
+    if (finish.toolCalls?.length > 1) validateParallelCallIds(finish.toolCalls);
     const scope = origin(params);
     prune(now());
     const key = keyFor(scope, thinking, signature);

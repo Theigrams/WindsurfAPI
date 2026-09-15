@@ -3341,9 +3341,15 @@ async function _handleChatCompletionsInner(body, context = {}) {
     if (nativeThinkingMode(selector) && emulateTools && !nativeStructured) {
       return { status: 400, body: { error: { type: 'invalid_request_error', code: 'NATIVE_THINKING_INCOMPATIBLE', message: 'Native thinking requires native tool definitions and calls.' } } };
     }
-    let connectMessages = emulateTools
-      ? normalizeMessagesForCascade(messages, connectTools, { modelKey: reqModelName, provider: null, route: 'devin_connect', toolChoice: tool_choice, injectUserPreamble: !suppressPreamble, stripOrphans: nativeDefsOn, nativeStructured })
-      : interleaveParallelToolMessages(messages);
+    let connectMessages;
+    try {
+      connectMessages = emulateTools
+        ? normalizeMessagesForCascade(messages, connectTools, { modelKey: reqModelName, provider: null, route: 'devin_connect', toolChoice: tool_choice, injectUserPreamble: !suppressPreamble, stripOrphans: nativeDefsOn, nativeStructured })
+        : interleaveParallelToolMessages(messages);
+    } catch (err) {
+      if (err.code !== 'NATIVE_THINKING_INCOMPATIBLE') throw err;
+      return { status: 400, body: { error: { type: 'invalid_request_error', code: err.code, message: err.message } } };
+    }
     // HYBRID native path: DEVIN_CONNECT has no proto tool_calling_section
     // slot, so the description-only preamble (buildToolPreambleForProto with
     // nativeStructured:true) is never built by normalizeMessagesForCascade —

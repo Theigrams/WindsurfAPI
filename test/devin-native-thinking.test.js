@@ -139,13 +139,19 @@ describe('Native thinking policy and wire fidelity', () => {
       assert.throws(() => prepareNativeThinking({ ...base, messages: [{ ...assistant(), nativeThinkingBlocks: blocks }] }), /only one/);
     }
   });
-  it('rejects signed parallel calls before splitting, and preserves unsigned pairing without duplicates', async () => {
+  it('keeps signed parallel calls atomic, and preserves unsigned pairing without duplicates', async () => {
     await collect(signedEvents());
     const results = [{ role: 'tool', tool_call_id: 'b', content: '2' }, { role: 'tool', tool_call_id: 'a', content: '1' }];
     const normalize = messages => normalizeMessagesForCascade(messages, [], { nativeStructured: true, stripOrphans: true, injectUserPreamble: false });
     const signed = normalize([{ ...assistant(), tool_calls: [tool('a'), tool('b')] }, ...results]);
     assert.equal(signed[0].tool_calls.length, 2);
-    assert.throws(() => wire({ ...base, messages: signed }), /parallel/);
+    const signedRows = wire({ ...base, messages: signed });
+    assert.equal(signedRows.length, 3);
+    assert.equal(getAllFields(signedRows[0], 6).length, 2);
+    assert.equal(str(signedRows[0], 12), signature);
+    assert.equal(str(signedRows[0], 18), 'sealed');
+    assert.deepEqual(signedRows.slice(1).map(r => str(r, 7)), ['a', 'b']);
+    assert.equal(signedRows.filter(r => getField(r, 12, 2)).length, 1);
     const unsigned = normalize([{ ...assistant(), nativeThinkingBlocks: [{ type: 'thinking', thinking }], tool_calls: [tool('a'), tool('b')] }, ...results]);
     const rows = wire({ ...base, model: 'glm-5-2-max', messages: unsigned });
     assert.equal(rows.filter(r => str(r, 11)).length, 1);
@@ -159,9 +165,54 @@ describe('Native thinking policy and wire fidelity', () => {
     assert.deepEqual(type.signature, { text: '', signatureType: 'sealed' });
     assert.throws(() => decodeFrame(writeMessageField(10, Buffer.from([255])), opts), /UTF-8/);
   });
+  it('preserves signed batch text, arguments, reversed image results and caller objects', async () => {
+    await collect(signedEvents());
+    const a = { ...assistant(), tool_calls: [tool('a'), { ...tool('b'), function: { name: 'lookup', arguments: '{"key":"B"}' } }] };
+    const image = { role: 'tool', tool_call_id: 'b', content: [{ type: 'text', text: 'image-b' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }] };
+    const messages = [a, image, { role: 'tool', tool_call_id: 'a', content: 'value-a' }];
+    const before = structuredClone(messages);
+    const normalized = normalizeMessagesForCascade(messages, [], { nativeStructured: true, stripOrphans: true, injectUserPreamble: false });
+    const rows = wire({ ...base, messages: normalized });
+    assert.equal(str(rows[0], 3), 'checking');
+    assert.deepEqual(getAllFields(rows[0], 6).map(f => str(parseFields(f.value), 3)), ['{}', '{"key":"B"}']);
+    assert.equal(str(rows[1], 7), 'a'); assert.equal(str(rows[1], 3), 'value-a');
+    assert.equal(str(rows[2], 7), 'b'); assert.equal(str(rows[2], 3), 'image-b');
+    assert.equal(getAllFields(rows[2], 10).length, 1);
+    assert.deepEqual(messages, before);
+  });
+  for (const [name, results] of [
+    ['missing result', [{ role: 'tool', tool_call_id: 'a', content: '1' }]],
+    ['duplicate result', ['a', 'a'].map(id => ({ role: 'tool', tool_call_id: id, content: '1' }))],
+    ['unknown result', ['a', 'x'].map(id => ({ role: 'tool', tool_call_id: id, content: '1' }))],
+    ['cross-user result', [{ role: 'tool', tool_call_id: 'a', content: '1' }, { role: 'user', content: 'pause' }, { role: 'tool', tool_call_id: 'b', content: '2' }]],
+  ]) it(`rejects ambiguous signed ${name} before orphan stripping or transport`, async () => {
+    await collect(signedEvents());
+    const messages = [{ ...assistant(), tool_calls: [tool('a'), tool('b')] }, ...results];
+    assert.throws(() => normalizeMessagesForCascade(messages, [], { nativeStructured: true, stripOrphans: true }), /Native thinking/);
+    assert.throws(() => wire({ ...base, messages }), /Native thinking/);
+  });
+  it('keeps repeated call IDs scoped to their own signed assistant turn', async () => {
+    await collect(signedEvents());
+    const messages = [1, 2].flatMap(n => [
+      { ...assistant(), tool_calls: [tool('a'), tool('b')] },
+      { role: 'tool', tool_call_id: 'b', content: `${n}-b` },
+      { role: 'tool', tool_call_id: 'a', content: `${n}-a` },
+    ]);
+    const rows = wire({ ...base, messages });
+    assert.equal(rows.length, 6);
+    assert.deepEqual(rows.filter(r => str(r, 7)).map(r => str(r, 3)), ['1-a', '1-b', '2-a', '2-b']);
+    assert.deepEqual(rows.filter(r => str(r, 12)).map(r => getAllFields(r, 6).length), [2, 2]);
+  });
 });
 
 describe('Native thinking response state machine', () => {
+  it('emits one late signature before text and preserves every parallel call', async () => {
+    const list = signedEvents(); list.at(-1).toolCalls = [tool('a'), tool('b'), tool('c')];
+    const out = await collect(list);
+    assert.deepEqual(out.map(e => e.type), ['reasoning', 'signature', 'content', 'finish']);
+    assert.deepEqual(out.at(-1).toolCalls, list.at(-1).toolCalls);
+    assert.equal(__thinkingTesting.size(), 1);
+  });
   it('reorders late signature before content, accumulates deltas once and retains separate type', async () => {
     const out = await collect(signedEvents());
     assert.deepEqual(out.map(e => e.type), ['reasoning', 'signature', 'content', 'finish']);
@@ -186,7 +237,8 @@ describe('Native thinking response state machine', () => {
     ['type change', [{ type: 'signature', signatureType: 'sealed' }, { type: 'signature', signatureType: 'other' }]],
     ['terminal mismatch', [{ type: 'signature', reasoning_signature: signature, signatureType: 'sealed' }, { type: 'finish', reasoning_signature: 'different' }]],
     ['overflow', [{ type: 'content', text: 'x'.repeat(__thinkingTesting.MAX_BYTES + 1) }]],
-    ['parallel signed response', [...signedEvents().slice(0, -1), { type: 'finish', toolCalls: [tool('a'), tool('b')] }]],
+    ['duplicate parallel call IDs', [...signedEvents().slice(0, -1), { type: 'finish', toolCalls: [tool('a'), tool('a')] }]],
+    ['missing parallel call ID', [...signedEvents().slice(0, -1), { type: 'finish', toolCalls: [tool('a'), tool('')] }]],
   ]) it(`fails closed on ${name}`, async () => { await assert.rejects(collect(list), /Native thinking/); assert.equal(__thinkingTesting.size(), 0); });
   it('does not register aborted responses', async () => {
     const ac = new AbortController(); ac.abort();
@@ -210,7 +262,7 @@ describe('Native thinking response state machine', () => {
 });
 
 describe('Full HTTP handler chain with only HTTPS transport mocked', () => {
-  for (const model of ['swe-2-high', 'glm-5.2']) for (const stream of [false, true]) for (const withTool of [false, true]) {
+  for (const model of ['swe-2-high', 'glm-5.2']) for (const stream of [false, true]) for (const withTool of [0, 1, 2, 3]) {
     const signed = model === 'swe-2-high';
     it(`replays real decoded frames through routing, session commit and wire (model=${model}, stream=${stream}, tool=${withTool})`, async () => {
       const flags = { DEVIN_CONNECT: '1', DEVIN_CONNECT_TOKEN: 'offline-http-transport-only', DEVIN_CONNECT_SESSION_REUSE: '1', DEVIN_CONNECT_MODEL_CONFIG_STABLE: '1', DEVIN_CONNECT_SESSION_MODELS: 'swe-2-high' };
@@ -227,7 +279,10 @@ describe('Full HTTP handler chain with only HTTPS transport mocked', () => {
           setImmediate(() => {
             const frames = [writeStringField(9, thinking), writeStringField(3, 'OK')];
             if (signed) frames.push(writeStringField(21, 'sealed'), writeStringField(10, signature.slice(0, 7)), writeStringField(10, signature.slice(7)));
-            if (withTool) frames.push(writeMessageField(6, Buffer.concat([writeStringField(1, 'tool-a'), writeStringField(2, 'lookup'), writeStringField(3, '{}')])));
+            for (let i = 0; i < withTool; i++) {
+              const id = `tool-${i}`;
+              frames.push(writeMessageField(6, Buffer.concat([writeStringField(1, id), writeStringField(2, 'lookup'), writeStringField(3, '{')])), writeMessageField(6, Buffer.concat([writeStringField(1, id), writeStringField(3, '}')])));
+            }
             frames.push(writeVarintField(5, 2));
             for (const frame of frames) { if (req.destroyed) return; res.emit('data', wrapEnvelope(frame, { compress: false })); }
             res.emit('data', endOfStreamEnvelope()); res.emit('end');
@@ -248,7 +303,19 @@ describe('Full HTTP handler chain with only HTTPS transport mocked', () => {
           content = assemble(es);
         } else content = response.body.content;
         assert.deepEqual(content[0], signed ? block() : { type: 'thinking', thinking });
-        messages.push({ role: 'assistant', content }, { role: 'user', content: withTool ? [{ type: 'tool_result', tool_use_id: 'tool-a', content: '7' }] : 'Continue.' });
+        const calls = content.filter(b => b.type === 'tool_use');
+        assert.equal(calls.length, withTool);
+        assert.deepEqual(calls.map(b => b.id), Array.from({length:withTool}, (_,i) => `tool-${i}`));
+        assert.ok(calls.every(b => JSON.stringify(b.input) === '{}'));
+        messages.push({ role: 'assistant', content }, { role: 'user', content: withTool ? calls.toReversed().map(c => ({ type: 'tool_result', tool_use_id: c.id, content: `value-${c.id}` })) : 'Continue.' });
+        if (signed && withTool > 1) {
+          const incomplete = structuredClone(messages);
+          incomplete.at(-1).content.pop();
+          const rejected = await handleMessages({ ...body, messages: incomplete }, context);
+          assert.equal(rejected.status, 400);
+          assert.equal(rejected.body.error.type, 'invalid_request_error');
+          assert.equal(requests.length, 1, 'malformed signed results must not reach HTTPS');
+        }
         const second = await handleMessages({ ...body, stream: false, messages }, context);
         assert.equal(second.status, 200, JSON.stringify(second.body.error));
         assert.equal(requests.length, 2);
@@ -256,7 +323,15 @@ describe('Full HTTP handler chain with only HTTPS transport mocked', () => {
         const rows = getAllFields(requests[1], 3).map(f => parseFields(f.value));
         const history = rows.filter(r => str(r, 11)); assert.equal(history.length, 1);
         assert.equal(str(history[0], 11), thinking); assert.equal(str(history[0], 12), signed ? signature : undefined); assert.equal(str(history[0], 18), signed ? 'sealed' : undefined);
-        if (withTool) assert.ok(rows.some(r => str(r, 7) === 'tool-a'));
+        if (withTool) {
+          assert.deepEqual(rows.filter(r => str(r, 7)).map(r => str(r, 7)), calls.map(c => c.id));
+          assert.deepEqual(rows.filter(r => str(r, 7)).map(r => str(r, 3)), calls.map(c => `value-${c.id}`));
+          if (signed) {
+            assert.equal(getAllFields(history[0], 6).length, withTool);
+            assert.equal(rows.filter(r => str(r, 12)).length, 1);
+            assert.deepEqual(getAllFields(history[0], 6).map(f => str(parseFields(f.value), 1)), calls.map(c => c.id));
+          }
+        }
       } finally {
         setExperimental(experimental); resetSessions();
         for (const [k, v] of Object.entries(old)) v === undefined ? delete process.env[k] : process.env[k] = v;

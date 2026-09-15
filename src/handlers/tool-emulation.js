@@ -21,7 +21,7 @@
  *     so the next cascade turn can see them.
  */
 
-import { nativeThinkingEnabled } from '../devin-thinking.js';
+import { nativeThinkingEnabled, hasSignedThinking, normalizeSignedToolHistory } from '../devin-thinking.js';
 import { log } from '../config.js';
 
 // "<workspace>" you may see is a redaction marker, NOT a literal path.
@@ -1150,9 +1150,9 @@ export function interleaveParallelToolMessages(messages) {
   while (i < messages.length) {
     const m = messages[i];
     if (m?.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 1) {
-      // Preserve unsupported signed batches intact so attempt validation rejects
-      // them before transport, rather than splitting one signature across calls.
-      if (nativeThinkingEnabled() && (m.nativeThinkingBlocks?.some(b => b.signature) || m.reasoning_signature)) { out.push(m); i++; continue; }
+      // Signed assistant batches remain atomic; the native encoder writes all
+      // calls on that message and emits the opaque signature exactly once.
+      if (nativeThinkingEnabled() && hasSignedThinking(m)) { out.push(m); i++; continue; }
       let j = i + 1;
       const toolMsgs = [];
       while (j < messages.length && messages[j]?.role === 'tool') {
@@ -1215,10 +1215,13 @@ export function normalizeMessagesForCascade(messages, tools, options = {}) {
   if (!Array.isArray(messages)) return messages;
   // Devin Connect & Cascade multi-turn: when nativeStructured mode is engaged
   // (native #10 ToolDef + #6 ChatToolCall on DEVIN_CONNECT), the upstream gRPC
-  // state machine requires tool_calls and results to be interleaved per turn.
+  // legacy path interleaves tool_calls and results per turn. Signed native turns
+  // instead retain one assistant with repeated calls and one signature, followed
+  // by the matching results; splitting would change the signed message boundary.
   // In text-emulation mode (nativeStructured: false, e.g. Kimi dialect),
   // dialect-specific batch formatters handle batch history.
   if (options.nativeStructured === true) {
+    if (nativeThinkingEnabled()) messages = normalizeSignedToolHistory(messages);
     messages = interleaveParallelToolMessages(messages);
   }
   // Orphan-stripping is OPT-IN (options.stripOrphans) — NOT the default. Doing it

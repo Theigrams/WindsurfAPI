@@ -1091,6 +1091,8 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
       continue;
     }
     if (thinkingMode && msg.role === 'assistant' && msg.nativeThinkingBlocks?.length) {
+      // Signed parallel turns are atomic. #6 is repeated within this message;
+      // summary/signature/type occur once, not once per tool-call/result pair.
       const block = msg.nativeThinkingBlocks[0];
       const parts = [writeStringField(1, randomUUID()), writeVarintField(2, SOURCE.ASSISTANT), writeStringField(3, messageText(msg.content))];
       for (const tc of msg.tool_calls || []) {

@@ -35,10 +35,17 @@ Keep the existing ModelConfig/cache settings. Native mode does not add
 
 ## Guarantees and limits
 
-- Plain text and one tool call per signed assistant are supported. Unsigned
-  parallel calls retain the existing call/result pairing, with thinking on the
-  first call only. Thinking text is not trimmed or promoted into normal content.
-- Multiple thinking blocks, redacted thinking, signed parallel calls, and
+- Plain text, single tools and parallel tools per signed assistant are supported.
+  A signed assistant remains one native message: its repeated field 6 contains
+  all tool calls, while fields 11/12/18 contain the summary/signature/type once.
+  Adjacent results are matched by tool-call ID and ordered by the original calls;
+  the assistant and signature are never split or copied across those results.
+  Parallel calls require unique nonempty IDs and one result for each ID before
+  the next conversation turn. Missing, duplicate or unknown results are rejected
+  before orphan stripping. Result text and images are preserved.
+  Unsigned parallel calls retain the existing call/result pairing, with thinking
+  on the first call only. Thinking text is not trimmed or promoted into content.
+- Multiple thinking blocks, redacted thinking, and
   reasoning that resumes after content are rejected. No unverified mapping is
   silently used. Signed mode also rejects local stop-sequence truncation.
 - Signed streams emit thinking immediately but hold later content until the
@@ -82,3 +89,11 @@ Passing local tests proves transport fidelity, not upstream acceptance or task
 quality. Before rollout, use isolated conversations and record model selector,
 field types, lengths/hashes, tool IDs and terminal success. Compare quality,
 latency and token cost separately; do not infer improvement from field presence.
+
+Signed parallel replay was verified against `swe-2-high` on 2026-09-16: streamed
+responses with two and three calls, reversed client result order, and a second
+generation that correctly combined the tool values. Raw requests contained one
+signed assistant message with all calls and exact upstream signature bytes/type.
+This does not establish support for multiple/interleaved thinking blocks or for
+other signed model selectors. The visible thinking text is a reasoning summary,
+not evidence of the full internal reasoning contents of an opaque signature.
