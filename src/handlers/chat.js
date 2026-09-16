@@ -518,6 +518,7 @@ export function connectErrorToHttp(code) {
     // caller must change the prompt, not retry or re-auth. NO account penalty.
     case 'CONTENT_BLOCKED': return { status: 400, type: 'invalid_request_error' };
     case 'NATIVE_THINKING_INCOMPATIBLE': return { status: 400, type: 'invalid_request_error' };
+    case 'NATIVE_THINKING_STORAGE_ERROR': return { status: 503, type: 'api_error' };
     case 'NO_TOKEN': return { status: 401, type: 'authentication_error' };
     case 'TIMEOUT': return { status: 504, type: 'timeout_error' };
     // Absolute wall-clock deadline (upstream hung the full window). Same 504
@@ -2388,7 +2389,7 @@ function isAbortError(err) {
 // classifyUpstreamError now claims it explicitly so it gets the UNAUTHORIZED arm's
 // re-login attempt rather than a bare eviction.
 const TRANSPORT_FAULT_CODES = new Set([
-  'TIMEOUT', 'DEADLINE_EXCEEDED', 'NO_TOKEN', 'NATIVE_THINKING_INCOMPATIBLE',
+  'TIMEOUT', 'DEADLINE_EXCEEDED', 'NO_TOKEN',
   'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH',
   'ENETUNREACH', 'EAI_AGAIN', 'ECONNABORTED',
   // Passed-through gRPC statuses: upstream load-shedding / stalls.
@@ -2494,6 +2495,9 @@ export function finalizeConnectAccount(acct, { model, selector = null, startTime
       bumpConnect('capacity_throttled');
     }
     else if (aborted) { /* no penalty — client left, and the upstream declared nothing */ }
+    else if (err.code === 'NATIVE_THINKING_INCOMPATIBLE' || err.code === 'NATIVE_THINKING_STORAGE_ERROR') {
+      // Local provenance validation/storage is not an upstream account fault.
+    }
     // MODEL_BLOCKED is a tier/entitlement wall (free account asked for a paid
     // selector → upstream "/upgrade"), NOT an account-health problem. Penalizing
     // it would demote a perfectly good free account toward eviction every time a
@@ -3515,14 +3519,20 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // is interleaved on the wire. Matching that wire history against a committed
     // unsplit response would invent a new session and invalidate earlier signatures.
     const connectSessionMessages = nativeThinkingMode(selector) ? nativeSessionHistory(messages) : connectMessages;
-    const connectSessionId = resolveConnectSessionId(callerKey || '', connectSessionMessages, connectSessionEnv);
-    if (connectSessionId) {
-      connectParams.sessionId = connectSessionId;
-      const modelCfg = getSessionConnectModelConfig(callerKey || '', connectSessionMessages, connectSessionEnv);
-      if (modelCfg) connectParams.sessionModelConfig = { id: modelCfg.configId, turn: modelCfg.turn };
-      const reasoningTrail = getSessionConnectReasoningTrail(callerKey || '', connectSessionMessages, connectSessionEnv);
-      if (reasoningTrail && !nativeThinkingMode(selector)) connectParams.continuityTrail = reasoningTrail;
-      log.info(`Chat[${reqId}]: DEVIN_CONNECT session reuse active → session_id=${connectSessionId}${modelCfg ? ` model_config=stable config_id=${modelCfg.configId} turn=${modelCfg.turn}` : ''} acct=${ccAcct?.account?.id || 'env-token'}`);
+    try {
+      const connectSessionId = resolveConnectSessionId(callerKey || '', connectSessionMessages, connectSessionEnv);
+      if (connectSessionId) {
+        connectParams.sessionId = connectSessionId;
+        const modelCfg = getSessionConnectModelConfig(callerKey || '', connectSessionMessages, connectSessionEnv);
+        if (modelCfg) connectParams.sessionModelConfig = { id: modelCfg.configId, turn: modelCfg.turn };
+        const reasoningTrail = getSessionConnectReasoningTrail(callerKey || '', connectSessionMessages, connectSessionEnv);
+        if (reasoningTrail && !nativeThinkingMode(selector)) connectParams.continuityTrail = reasoningTrail;
+        log.info(`Chat[${reqId}]: DEVIN_CONNECT session reuse active → session_id=${connectSessionId}${modelCfg ? ` model_config=stable config_id=${modelCfg.configId} turn=${modelCfg.turn}` : ''} acct=${ccAcct?.account?.id || 'env-token'}`);
+      }
+    } catch (err) {
+      if (err.code !== 'NATIVE_THINKING_STORAGE_ERROR') throw err;
+      if (ccAcct) releaseAccountById(ccAcct.id);
+      return { status: 503, body: { error: { type: 'api_error', code: err.code, message: err.message } } };
     }
     if (ccAcct) {
       connectParams.token = ccAcct.apiKey;
@@ -3863,7 +3873,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
                     ...(tc?.length ? { tool_calls: tc.map((t, idx) => ({ id: t.id || `tc_${idx}`, function: { name: t.name, arguments: t.argumentsJson || t.arguments || '' } })) } : {}),
                   }];
                   commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: r.sr?.reasoning || incomingConnectReasoning });
-                } catch { /* session commit is best-effort */ }
+                } catch (err) {
+                  if (err.code === 'NATIVE_THINKING_STORAGE_ERROR') log.error(`Chat[${reqId}]: ${err.message}`);
+                }
                 break;
               }
               // #225: a client-gone abort is not an account fault — stop the
@@ -4024,7 +4036,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
             ...(msg?.tool_calls ? { tool_calls: msg.tool_calls } : {}),
           }];
           commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: msg?.reasoning_content || incomingConnectReasoning });
-        } catch { /* session commit is best-effort */ }
+        } catch (err) {
+          if (err.code === 'NATIVE_THINKING_STORAGE_ERROR') log.error(`Chat[${reqId}]: ${err.message}`);
+        }
         return r.out;
       }
       if (r.kind === 'abort') {

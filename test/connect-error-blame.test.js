@@ -45,6 +45,14 @@ beforeEach(() => { created.length = 0; });
 afterEach(() => { while (created.length) removeAccount(created.pop()); });
 
 describe('request-side failures never evict the account', () => {
+  for (const code of ['NATIVE_THINKING_INCOMPATIBLE', 'NATIVE_THINKING_STORAGE_ERROR']) {
+    it(`${code} does not charge account errors or the internal-error circuit breaker`, () => {
+      const acct = seed('local-provenance'); seed('healthy-peer');
+      const after = fail(acct, code);
+      assert.equal(after.errorCount || 0, 0);
+      assert.equal(after.internalErrorStreak || 0, 0);
+    });
+  }
   // A healthy peer must exist, otherwise the last-account exemption masks the
   // eviction and the test would pass for the wrong reason.
   // STREAM_TRUNCATED joined this list when the truncation detection shipped: the

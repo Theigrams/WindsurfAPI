@@ -119,25 +119,36 @@ describe('Native thinking policy and wire fidelity', () => {
       assert.throws(() => wire({ ...base, ...change, messages: [assistant()] }), /Native thinking/);
     });
   }
-  it('rejects unknown, expired, mutated and restart-lost signature metadata', async () => {
+  it('rejects unknown, idle-expired and mutated signatures, and reloads saved provenance', async () => {
     const params = { ...base, messages: [assistant()] };
     assert.throws(() => prepareNativeThinking(params), /unknown/);
     const now = Date.now(); await collect(signedEvents(), base, () => now);
-    assert.throws(() => prepareNativeThinking({ ...base, messages: [{ ...assistant(), nativeThinkingBlocks: [{ ...block(), thinking: thinking.trim() }] }] }), /unknown/);
-    assert.throws(() => prepareNativeThinking(params, now + __thinkingTesting.TTL_MS), /unknown/);
-    await collect(signedEvents()); __thinkingTesting.clear();
-    assert.throws(() => prepareNativeThinking(params), /unknown/);
+    assert.throws(() => prepareNativeThinking({ ...base, messages: [{ ...assistant(), nativeThinkingBlocks: [{ ...block(), thinking: thinking.trim() }] }] }), /THINKING_MISMATCH/);
+    assert.throws(() => prepareNativeThinking(params, now + __thinkingTesting.TTL_MS), /SIGNATURE_EXPIRED/);
+    await collect(signedEvents()); __thinkingTesting.reload();
+    assert.equal(prepareNativeThinking(params).messages[0].nativeThinkingBlocks[0].signature, signature);
   });
   it('does not trust supplied signature type or origin claims', async () => {
     await collect(signedEvents());
     const rows = wire({ ...base, messages: [{ ...assistant(), nativeThinkingBlocks: [{ ...block(), signatureType: 'forged-type', origin: base }] }] });
     assert.equal(str(rows[0], 18), 'sealed');
   });
+  it('renews the whole valid history but never renews a prefix of an invalid request', async () => {
+    const start = Date.now();
+    await collect(signedEvents(), base, () => start);
+    const params = { ...base, messages: [assistant()] };
+    const nearExpiry = start + __thinkingTesting.TTL_MS - 1000;
+    assert.doesNotThrow(() => prepareNativeThinking(params, nearExpiry));
+    __thinkingTesting.reload();
+    const invalid = { ...assistant(), nativeThinkingBlocks: [{ ...block(), signature: 'unregistered-fixture' }] };
+    assert.throws(() => prepareNativeThinking({ ...params, messages: [assistant(), invalid] }, nearExpiry + 500), /SIGNATURE_UNKNOWN/);
+    assert.throws(() => prepareNativeThinking(params, nearExpiry + __thinkingTesting.TTL_MS), /SIGNATURE_EXPIRED/);
+  });
   it('rejects switching between two explicitly allowed signed selectors before transport', async () => {
     await collect(signedEvents());
     let transports = 0;
     __setStreamChatForTest(async function* () { transports++; yield { type: 'finish' }; });
-    await assert.rejects(toChatCompletion({ ...base, model: 'swe-2-max', env: { ...env, DEVIN_CONNECT_NATIVE_THINKING_SIGNED_MODELS: 'swe-2-high,swe-2-max' }, messages: [assistant()] }), /unknown/);
+    await assert.rejects(toChatCompletion({ ...base, model: 'swe-2-max', env: { ...env, DEVIN_CONNECT_NATIVE_THINKING_SIGNED_MODELS: 'swe-2-high,swe-2-max' }, messages: [assistant()] }), /SIGNATURE_ORIGIN_MISMATCH/);
     assert.equal(transports, 0);
   });
   it('rejects missing stable session and prompt injection', () => {
@@ -262,12 +273,14 @@ describe('Native thinking response state machine', () => {
     assert.equal(attempts, 1); assert.equal(__thinkingTesting.size(), 0);
     assert.equal(sent.some(c => c.choices?.[0]?.delta?.reasoning_signature), false);
   });
-  it('bounds registry capacity and rejects the evicted oldest entry', async () => {
-    for (let i = 0; i < __thinkingTesting.MAX_RECORDS + 1; i++) {
+  it('rejects excess capacity without evicting still-live signatures', async () => {
+    __thinkingTesting.setCapacity(3);
+    for (let i = 0; i < 3; i++) {
       await collect([{ type: 'signature', reasoning_signature: `unit-${i}`, signatureType: 'sealed' }, { type: 'finish' }]);
     }
-    assert.equal(__thinkingTesting.size(), __thinkingTesting.MAX_RECORDS);
-    assert.throws(() => prepareNativeThinking({ ...base, messages: [{ role: 'assistant', content: '', nativeThinkingBlocks: [{ type: 'thinking', thinking: '', signature: 'unit-0' }] }] }), /unknown/);
+    await assert.rejects(collect([{ type: 'signature', reasoning_signature: 'overflow', signatureType: 'sealed' }, { type: 'finish' }]), /capacity/);
+    assert.equal(__thinkingTesting.size(), 3);
+    assert.doesNotThrow(() => prepareNativeThinking({ ...base, messages: [{ role: 'assistant', content: '', nativeThinkingBlocks: [{ type: 'thinking', thinking: '', signature: 'unit-0' }] }] }));
   });
 });
 

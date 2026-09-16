@@ -63,13 +63,33 @@ Keep the existing ModelConfig/cache settings. Native mode does not add
 - Thinking, signatures, content, and terminal tool calls share a 2 MiB response
   limit. Each replayed thinking/signature pair also has a 2 MiB limit. Aborted,
   truncated, overflowing, or inconsistent responses do not create replay records.
-- The in-memory provenance table stores hashes and upstream types, not thinking,
-  signatures or tokens. It has 500 entries and a 30-minute lifetime. A signed
+- The durable provenance table stores hashes and upstream types, not thinking,
+  signatures or tokens. Its idle retention is 30 days, renewed only after every
+  signed block in an incoming history passes validation. There is no fixed
+  30-minute deadline from issuance. Up to 50,000 live signatures are retained;
+  reaching capacity rejects new registrations instead of silently evicting a
+  live signature. A signed
   replay must match the exact thinking, signature, caller, selector, token and
   session that produced it. Token rotation is conservatively a new account scope.
-- Unknown/imported, expired, evicted or restart-lost signatures fail with
-  `NATIVE_THINKING_INCOMPATIBLE`. Client-provided signature types are not trusted.
+- Signature metadata and native signed-session identifiers are saved atomically
+  in `native-thinking-signatures.json` and `native-thinking-sessions.json` under
+  `config.dataDir`, with mode 0600. The latter also preserves the hashing seed,
+  pair hashes and ModelConfig counter; it does not persist pair text or reasoning
+  tails. Both files are replica-local, single-writer state and must be preserved
+  together across restarts. Signed sessions use the same 30-day idle retention.
+  The existing session count limit still applies; live native sessions are not
+  evicted to make room. Unsigned session matching keeps its existing retention.
+- Unknown/imported signatures, idle expiration, modified summaries and mismatched
+  origins fail with `NATIVE_THINKING_INCOMPATIBLE`, with distinct reason labels:
+  `SIGNATURE_UNKNOWN`, `SIGNATURE_EXPIRED`, `THINKING_MISMATCH`, and
+  `SIGNATURE_ORIGIN_MISMATCH`. Client-provided signature types are not trusted.
   No cross-model/session/account fallback is attempted for signed history.
+- Unreadable, corrupt, full or unwritable local provenance storage fails closed
+  with `NATIVE_THINKING_STORAGE_ERROR` (503). Local validation/storage failures do
+  not penalize the upstream account or trip its internal-error circuit breaker.
+- Upgrade boundary: registrations already expired or lost before persistence was
+  enabled cannot be reconstructed from incoming client history. Such old sessions
+  need a fresh conversation; do not invent provenance for their signatures.
 - The table associates provenance; it does not cryptographically validate the
   signature or establish what upstream fields the opaque signature binds to.
 - Only signatures losslessly representable as UTF-8 strings are supported.
@@ -85,7 +105,7 @@ Keep the existing ModelConfig/cache settings. Native mode does not add
 ## Verification
 
 ```bash
-node --import ./test/setup-env.mjs --test test/devin-native-thinking.test.js
+node --import ./test/setup-env.mjs --test test/devin-native-thinking.test.js test/native-thinking-persistence.test.js
 ```
 
 The tests cover mocked protobuf frames through the actual HTTP handlers,

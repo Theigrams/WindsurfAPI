@@ -1,9 +1,15 @@
 // Opt-in native Devin thinking. Opaque signatures are never interpreted or minted.
-import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { config } from './config.js';
+import { NativeThinkingRegistry, nativeOrigin, MAX_NATIVE_RECORDS } from './native-thinking-registry.js';
+import { NATIVE_RETENTION_MS } from './native-thinking-storage.js';
 
-const issued = new Map();
-const TTL_MS = 30 * 60 * 1000;
-const MAX_RECORDS = 500;
+const registryFile = path.join(config.dataDir, 'native-thinking-signatures.json');
+let registry;
+const getRegistry = () => registry ||= new NativeThinkingRegistry(registryFile);
+const TTL_MS = NATIVE_RETENTION_MS;
+const MAX_RECORDS = MAX_NATIVE_RECORDS;
 const MAX_BYTES = 2 * 1024 * 1024;
 // Adapter-only role provenance for session identity. A Symbol cannot be supplied
 // in JSON or leak into serialized client/upstream messages.
@@ -12,7 +18,6 @@ export function nativeSessionHistory(messages) {
   return messages.map(m => ['system', 'developer'].includes(m[nativeSessionRole])
     ? { ...m, role: m[nativeSessionRole] } : m);
 }
-const hash = value => createHash('sha256').update(value).digest('hex');
 export const nativeThinkingEnabled = (env = process.env) => env.DEVIN_CONNECT_NATIVE_THINKING === '1';
 export function nativeThinkingMode(model, env = process.env) {
   if (!nativeThinkingEnabled(env)) return null;
@@ -76,13 +81,7 @@ function origin(params) {
   if (!params.token || !params.sessionId || typeof params.nativeThinkingScope !== 'string') {
     throw thinkingError('signed replay requires an explicit caller scope, account token and stable session.');
   }
-  return hash(JSON.stringify([params.nativeThinkingScope, params.model, hash(params.token), params.sessionId]));
-}
-function prune(now) {
-  for (const [key, entry] of issued) if (entry.expires <= now) issued.delete(key);
-}
-function keyFor(scope, thinking, signature) {
-  return hash(JSON.stringify([scope, thinking, signature]));
+  return nativeOrigin(params);
 }
 
 // Called at each network attempt, after final model/account/session selection.
@@ -107,7 +106,7 @@ export function prepareNativeThinking(params, now = Date.now()) {
   }
   if (params.continuityTrail) throw thinkingError('native replay cannot be combined with reasoning prompt injection.');
   const scope = mode === 'signed' ? origin(params) : null;
-  prune(now);
+  const verifiedKeys = [];
   const normalized = normalizeSignedToolHistory(messages).map(m => {
     const blocks = blocksFor(m);
     if (!blocks.length) return m;
@@ -123,13 +122,16 @@ export function prepareNativeThinking(params, now = Date.now()) {
     const copy = { type: 'thinking', thinking: block.thinking };
     if (block.signature) {
       if (mode !== 'signed') throw thinkingError('signed history cannot be replayed by an unsigned model.');
-      const record = issued.get(keyFor(scope, block.thinking, block.signature));
-      if (!record) throw thinkingError('signature origin is unknown, expired, or differs in thinking/model/account/session.');
+      const record = getRegistry().lookup(scope, block.thinking, block.signature, now);
+      verifiedKeys.push(record.key);
       copy.signature = block.signature;
       copy.signatureType = record.type;
     }
     return { ...m, nativeThinkingBlocks: [copy] };
   });
+  // Renew only after the entire history passes validation. Invalid batches cannot
+  // extend retention for an otherwise valid prefix. Persist before dispatch.
+  if (verifiedKeys.length) getRegistry().touch(verifiedKeys, now);
   return { ...params, messages: normalized };
 }
 
@@ -181,17 +183,17 @@ export async function* nativeThinkingEvents(source, params, now = () => Date.now
     if (mode !== 'signed' || !type) throw thinkingError('signature has no verified upstream type.');
     if (finish.toolCalls?.length > 1) validateParallelCallIds(finish.toolCalls);
     const scope = origin(params);
-    prune(now());
-    const key = keyFor(scope, thinking, signature);
-    const old = issued.get(key);
-    if (old && old.type !== type) throw thinkingError('signature type changed for an existing block.');
-    issued.delete(key);
-    issued.set(key, { type, expires: now() + TTL_MS });
-    while (issued.size > MAX_RECORDS) issued.delete(issued.keys().next().value);
+    // Durably register before exposing the opaque signature to the client.
+    getRegistry().issue(scope, thinking, signature, type, now());
     yield { type: 'signature', reasoning_signature: signature, signatureType: type };
   }
   for (const ev of pending) yield ev;
   yield finish;
 }
 
-export const __thinkingTesting = { clear: () => issued.clear(), size: () => issued.size, TTL_MS, MAX_RECORDS, MAX_BYTES };
+export const __thinkingTesting = {
+  clear() { registry = undefined; try { fs.unlinkSync(registryFile); } catch (e) { if (e.code !== 'ENOENT') throw e; } },
+  reload() { registry = undefined; },
+  setCapacity(n) { getRegistry().maxRecords = n; },
+  size: () => getRegistry().records.size, TTL_MS, MAX_RECORDS, MAX_BYTES, registryFile,
+};
