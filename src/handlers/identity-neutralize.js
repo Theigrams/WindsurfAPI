@@ -134,8 +134,14 @@ export function neutralizeClientIdentity(text, env = process.env, opts = {}) {
     out = next;
   };
   // (a) competitor self-identification (529 gate). Both straight (') and curly (’).
+  // Desktop subagents add an SDK suffix and a second agent identity sentence.
+  // Match the complete declarations; leave the following task instructions intact.
+  rule('a1-cc-agent',
+    /You are an agent for Claude Code,\s*Anthropic['’]?s official CLI for Claude\.?/gi,
+    'You are an AI coding assistant.',
+  );
   rule('a1-cc-full',
-    /You are Claude Code,\s*Anthropic['’]?s official CLI for Claude\.?/gi,
+    /You are Claude Code,\s*Anthropic['’]?s official CLI for Claude(?:,\s*running within the Claude Agent SDK)?\.?/gi,
     'You are an AI coding assistant.',
   );
   rule('a1-cc-noun',
@@ -304,6 +310,15 @@ export function neutralizeClientIdentity(text, env = process.env, opts = {}) {
   // Live-confirmed ⇒ unconditional, on the main WINDSURFAPI_NEUTRALIZE_CLIENT_ID switch.
   rule('a7-freeform', /FREEFORM/g, 'free-form');
   rule('a7-json-wrap', /do not wrap the patch in JSON\./g, 'provide the patch as plain text.');
+  // Claude Desktop subagent style instruction: the captured sentence was
+  // rejected on swe-1-7 in isolated probes, while this equivalent wording and
+  // the full captured request were accepted (2026-09-16). Preserve the no-emoji
+  // requirement. Match only this complete instruction at a line boundary, not
+  // arbitrary prose mentioning emojis or quoted source examples.
+  rule('a8-cc-plain-text-style',
+    /(^|\n)([ \t]*(?:-[ \t]*)?)For clear communication with the user the assistant MUST avoid using emojis\./g,
+    '$1$2Use plain text without emojis when communicating with the user.',
+  );
   // (cc) SPECULATIVE / DEFAULT-OFF — Claude-Code-specific aggressive rules. Gated
   // by the CC compat layer being active for this request (opts.ccActive, i.e.
   // /v1/cc/* or detected + master toggle) OR the env opt-in. INTENTIONALLY EMPTY

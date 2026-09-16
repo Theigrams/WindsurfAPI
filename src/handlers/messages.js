@@ -566,7 +566,7 @@ function normalizeToolResultContent(content, annotationOptions) {
 // NB: a bare `export { x } from …` does NOT create a local binding, so the
 // internal call site would throw ReferenceError — hence the explicit import.
 export { neutralizeClientIdentity } from './identity-neutralize.js';
-import { neutralizeClientIdentity } from './identity-neutralize.js';
+import { neutralizeClientIdentity, neutralizeMessageContent } from './identity-neutralize.js';
 
 function anthropicToOpenAI(body, ccActive = false) {
   const cachePolicy = extractCachePolicy(body);
@@ -606,23 +606,29 @@ function anthropicToOpenAI(body, ccActive = false) {
     if (sysText) messages.push({ role: 'system', content: sysText });
   }
   for (const m of (body.messages || [])) {
+    // Process client-supplied system text before the legacy wire role mapping
+    // below loses its provenance. Never apply these rules to task text, signed
+    // assistant history, tool arguments or tool results.
+    const isSystemContent = ['system', 'developer'].includes(m.role);
+    const sourceContent = isSystemContent
+      ? neutralizeMessageContent(m.content, process.env, { ccActive }) : m.content;
     // Some relays retain system/developer entries inside the Anthropic history.
     // Keep their original role for session identity, independently of the legacy
     // wire conversion below. Changing a system reminder must not look like an
     // edited user turn and invalidate otherwise unchanged signed history.
-    const sessionMeta = nativeThinkingEnabled() && ['system', 'developer'].includes(m.role)
+    const sessionMeta = nativeThinkingEnabled() && isSystemContent
       ? { [nativeSessionRole]: m.role } : {};
     const role = m.role === 'assistant' ? 'assistant' : 'user';
-    if (typeof m.content === 'string') {
-      messages.push({ ...sessionMeta, role, content: m.content });
-    } else if (Array.isArray(m.content)) {
+    if (typeof sourceContent === 'string') {
+      messages.push({ ...sessionMeta, role, content: sourceContent });
+    } else if (Array.isArray(sourceContent)) {
       const textParts = [];
       const imageParts = [];
       const toolCalls = [];
       const toolResults = [];
       const msgThinking = [];
       const nativeThinkingBlocks = [];
-      for (const block of m.content) {
+      for (const block of sourceContent) {
         if (block.type === 'text') {
           textParts.push(block.text || '');
         } else if (block.type === 'image') {
