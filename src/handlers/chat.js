@@ -3,7 +3,7 @@
  * Routes to RawGetChatMessage (legacy) or Cascade (premium) based on model type.
  */
 
-import { nativeThinkingMode } from '../devin-thinking.js';
+import { nativeThinkingMode, nativeSessionHistory } from '../devin-thinking.js';
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
 import { getApiKey, acquireAccountByKey, releaseAccountById, currentApiKeyForId, getAccountAvailability, reportError, reportSuccess, markRateLimited, markQuotaExhausted, reportInternalError, reportDeadToken, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, isConnectSelectorBlockedByDrought, getDroughtSummary, reLoginAccount, getAccountCount, hasConnectEntitledAccount, recordAccountSpend, ensureDeviceSeed } from '../auth.js';
@@ -3514,7 +3514,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // In native thinking mode a signed batch stays atomic, but an unsigned batch
     // is interleaved on the wire. Matching that wire history against a committed
     // unsplit response would invent a new session and invalidate earlier signatures.
-    const connectSessionMessages = nativeThinkingMode(selector) ? messages : connectMessages;
+    const connectSessionMessages = nativeThinkingMode(selector) ? nativeSessionHistory(messages) : connectMessages;
     const connectSessionId = resolveConnectSessionId(callerKey || '', connectSessionMessages, connectSessionEnv);
     if (connectSessionId) {
       connectParams.sessionId = connectSessionId;

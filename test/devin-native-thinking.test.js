@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { nativeThinkingMode, prepareNativeThinking, nativeThinkingEvents, __thinkingTesting } from '../src/devin-thinking.js';
+import { nativeThinkingMode, prepareNativeThinking, nativeThinkingEvents, nativeSessionRole, nativeSessionHistory, __thinkingTesting } from '../src/devin-thinking.js';
 import { buildGetChatMessageRequest, decodeFrame, __setRequestImpl } from '../src/devin-connect.js';
 import { wrapEnvelope, endOfStreamEnvelope } from '../src/connect.js';
 import { getExperimental, setExperimental } from '../src/runtime-config.js';
@@ -62,6 +62,16 @@ beforeEach(() => { saved = Object.fromEntries(Object.keys(env).map(k => [k, proc
 afterEach(() => { for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : process.env[k] = v; __setStreamChatForTest(null); __setRequestImpl(null); __thinkingTesting.clear(); });
 
 describe('Native thinking policy and wire fidelity', () => {
+  it('uses only internal role provenance for session matching without rewriting wire messages', async () => {
+    let converted;
+    await handleMessages({model:'swe-2-high',messages:[{role:'system',content:'reminder'},{role:'developer',content:[{type:'text',text:'developer'}]},{role:'user',content:'question',nativeSessionRole:'system'}]}, {handleChatCompletions:async b=>{converted=b.messages;return {status:200,body:{choices:[{message:{role:'assistant',content:'ok'}}]}};}});
+    assert.deepEqual(converted.map(m=>m.role),['user','user','user']);
+    assert.equal(converted[0][nativeSessionRole],'system');
+    assert.deepEqual(nativeSessionHistory(converted).map(m=>m.role),['system','developer','user']);
+    assert.equal(JSON.stringify(converted).includes('nativeSessionRole'),false);
+    assert.equal(nativeSessionHistory([{role:'user',content:'x',nativeSessionRole:'system'}])[0].role,'user');
+  });
+
   it('is off by default and requires an explicit exact selector allowlist', () => {
     assert.equal(nativeThinkingMode('swe-2-high', {}), null);
     assert.equal(nativeThinkingMode('swe-2-max', env), null);
@@ -341,7 +351,7 @@ describe('Full HTTP handler chain with only HTTPS transport mocked', () => {
 });
 
 describe('Mixed signed and unsigned parallel turns retain native session identity', () => {
-  for (const stream of [true, false]) it(`keeps the original signature valid on turn three (stream=${stream})`, async () => {
+  for (const stream of [true, false]) for (const reminders of [false, true]) it(`keeps the original signature valid on turn three (stream=${stream}, reminders=${reminders})`, async () => {
     const flags = { DEVIN_CONNECT: '1', DEVIN_CONNECT_TOKEN: 'offline-mixed', DEVIN_CONNECT_SESSION_REUSE: '1', DEVIN_CONNECT_MODEL_CONFIG_STABLE: '1', DEVIN_CONNECT_SESSION_MODELS: 'swe-2-high' };
     const old = Object.fromEntries(Object.keys(flags).map(k => [k, process.env[k]]));
     const experimental = getExperimental();
@@ -369,9 +379,13 @@ describe('Mixed signed and unsigned parallel turns retain native session identit
       return req;
     });
     try {
-      const messages = [{ role:'user', content:'First A/B, then C/D, then combine.' }];
+      const messages = [{ role:'user', content:'First A/B, then C/D, then combine.' }, ...(reminders ? [{role:'system',content:[{type:'text',text:'dynamic reminder v1'}]}, {role:'developer',content:'dynamic developer v1'}] : [])];
       const body = {model:'swe-2-high', stream, messages, tools:[{name:'lookup',input_schema:{type:'object',properties:{key:{type:'integer'}}}}]};
       for (let turn=1; turn<=3; turn++) {
+        if (reminders) {
+          messages[1].content[0].text = `dynamic reminder v${turn}`;
+          messages[2].content = `dynamic developer v${turn}`;
+        }
         const reply = await handleMessages(body,{callerKey:'mixed-signature-client'});
         assert.equal(reply.status,200,JSON.stringify(reply.body?.error));
         let content;

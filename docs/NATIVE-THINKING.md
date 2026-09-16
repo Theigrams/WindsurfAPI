@@ -49,6 +49,10 @@ Keep the existing ModelConfig/cache settings. Native mode does not add
   boundaries, before transport-specific tool splitting. A signed parallel turn
   followed by an unsigned parallel turn must retain the same session/ModelConfig;
   splitting the latter for the wire must not invalidate earlier signatures.
+  For relays that include system/developer messages inside Anthropic history,
+  the adapter retains original-role provenance for session matching. Updating a
+  system reminder therefore does not count as editing a prior user turn. This
+  internal annotation is not serialized and does not change wire conversion.
 - Multiple thinking blocks, redacted thinking, and
   reasoning that resumes after content are rejected. No unverified mapping is
   silently used. Signed mode also rejects local stop-sequence truncation.

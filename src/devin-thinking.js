@@ -5,6 +5,13 @@ const issued = new Map();
 const TTL_MS = 30 * 60 * 1000;
 const MAX_RECORDS = 500;
 const MAX_BYTES = 2 * 1024 * 1024;
+// Adapter-only role provenance for session identity. A Symbol cannot be supplied
+// in JSON or leak into serialized client/upstream messages.
+export const nativeSessionRole = Symbol('nativeSessionRole');
+export function nativeSessionHistory(messages) {
+  return messages.map(m => ['system', 'developer'].includes(m[nativeSessionRole])
+    ? { ...m, role: m[nativeSessionRole] } : m);
+}
 const hash = value => createHash('sha256').update(value).digest('hex');
 export const nativeThinkingEnabled = (env = process.env) => env.DEVIN_CONNECT_NATIVE_THINKING === '1';
 export function nativeThinkingMode(model, env = process.env) {

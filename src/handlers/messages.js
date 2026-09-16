@@ -12,7 +12,7 @@
  */
 
 import { createHash, randomUUID } from 'crypto';
-import { nativeThinkingEnabled } from '../devin-thinking.js';
+import { nativeThinkingEnabled, nativeSessionRole } from '../devin-thinking.js';
 import { handleChatCompletions, connectErrorToHttp } from './chat.js';
 import { log } from '../config.js';
 import { leakTraceEnabled, thinkMarkersIn, leakSample } from '../leak-trace.js';
@@ -606,9 +606,15 @@ function anthropicToOpenAI(body, ccActive = false) {
     if (sysText) messages.push({ role: 'system', content: sysText });
   }
   for (const m of (body.messages || [])) {
+    // Some relays retain system/developer entries inside the Anthropic history.
+    // Keep their original role for session identity, independently of the legacy
+    // wire conversion below. Changing a system reminder must not look like an
+    // edited user turn and invalidate otherwise unchanged signed history.
+    const sessionMeta = nativeThinkingEnabled() && ['system', 'developer'].includes(m.role)
+      ? { [nativeSessionRole]: m.role } : {};
     const role = m.role === 'assistant' ? 'assistant' : 'user';
     if (typeof m.content === 'string') {
-      messages.push({ role, content: m.content });
+      messages.push({ ...sessionMeta, role, content: m.content });
     } else if (Array.isArray(m.content)) {
       const textParts = [];
       const imageParts = [];
@@ -680,8 +686,8 @@ function anthropicToOpenAI(body, ccActive = false) {
       }
       // Tool results must directly follow the assistant tool_calls message
       // in OpenAI format. Push them before the user content message.
-      for (const tr of toolResults) messages.push(tr);
-      const nativeMeta = nativeThinkingBlocks.length ? { nativeThinkingBlocks } : {};
+      for (const tr of toolResults) messages.push({ ...sessionMeta, ...tr });
+      const nativeMeta = { ...sessionMeta, ...(nativeThinkingBlocks.length ? { nativeThinkingBlocks } : {}) };
       if (toolCalls.length) {
         messages.push({
           ...nativeMeta,
