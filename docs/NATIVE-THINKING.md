@@ -21,9 +21,13 @@ selecting models. An empty list enables nothing. A selector on both lists uses
 the signed policy. Do not treat the list as a claim that a provider supports
 replay; acceptance must be tested separately for each selector.
 
-Unlisted models with unsigned history keep their legacy conversion behavior.
-Signed history sent to an unlisted selector is rejected to prevent accidental
-cross-model replay.
+Unlisted models keep the exact feature-off conversion behavior. Foreign signed
+history sent to an unlisted selector is stripped of its signature metadata
+before legacy interleave and normalization rather than rejected, so sessions
+mixed across providers do not fail. Stripped thinking is never replayed
+upstream, and no signature field reaches the wire. Text selectors replay the
+thinking summary as an unsigned block: the opaque signature is dropped and the
+history is not rejected merely because a signature is present.
 
 Signed mode requires an explicit caller scope, account token, stable session,
 and native structured tools when tools are used. For the HTTP route this means
@@ -31,7 +35,9 @@ and native structured tools when tools are used. For the HTTP route this means
 `DEVIN_CONNECT_SESSION_MODELS` allowlist, and `experimental.nativeToolCall=true`.
 Keep the existing ModelConfig/cache settings. Native mode does not add
 `DEVIN_CONNECT_SESSION_REASONING_INJECT` checkpoints. The legacy
-`DEVIN_CONNECT_REPLAY_REASONING` probe is independent and unnecessary here.
+`DEVIN_CONNECT_REPLAY_REASONING` probe is unnecessary here and only applies
+while native thinking is off. It cannot reintroduce unsigned thinking for an
+unlisted selector while native replay policy is enabled.
 
 ## Guarantees and limits
 

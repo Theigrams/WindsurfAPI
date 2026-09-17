@@ -1,7 +1,7 @@
 // Opt-in native Devin thinking. Opaque signatures are never interpreted or minted.
 import fs from 'node:fs';
 import path from 'node:path';
-import { config } from './config.js';
+import { config, log } from './config.js';
 import { NativeThinkingRegistry, nativeOrigin, MAX_NATIVE_RECORDS } from './native-thinking-registry.js';
 import { NATIVE_RETENTION_MS } from './native-thinking-storage.js';
 
@@ -38,6 +38,26 @@ function blocksFor(message) {
 }
 export function hasSignedThinking(message) {
   return message?.role === 'assistant' && blocksFor(message).some(b => b?.signature);
+}
+
+// Restore the feature-off invariant outside the replay allowlists: foreign
+// signature metadata is stripped before legacy interleave/normalize so signed
+// history from another provider cannot alter the wire, trip signed-batch
+// validation, or reach an upstream that would verify it. 'text' selectors keep
+// unsigned thinking text; unlisted selectors drop native metadata entirely.
+export function stripForeignSignedThinking(messages, mode) {
+  if (mode === 'signed' || !Array.isArray(messages)) return messages;
+  return messages.map(m => {
+    if (mode === 'text') {
+      if (!m.reasoning_signature && !m.nativeThinkingBlocks?.some(b => b?.signature || b?.signatureType)) return m;
+      const { reasoning_signature: _sig, ...rest } = m;
+      if (!rest.nativeThinkingBlocks) return rest;
+      return { ...rest, nativeThinkingBlocks: rest.nativeThinkingBlocks.map(({ signature: _s, signatureType: _t, ...b }) => b) };
+    }
+    if (!Object.hasOwn(m, 'nativeThinkingBlocks') && !Object.hasOwn(m, 'reasoning_signature')) return m;
+    const { nativeThinkingBlocks: _blocks, reasoning_signature: _sig, ...legacy } = m;
+    return legacy;
+  });
 }
 
 // A signed assistant turn is one protocol message: repeated #6 tool calls share
@@ -92,22 +112,19 @@ export function prepareNativeThinking(params, now = Date.now(), { renew = true }
   const mode = nativeThinkingMode(params.model, env);
   const messages = params.messages || [];
   if (!mode) {
-    if (messages.some(m => blocksFor(m).some(b => b?.signature))) {
-      throw thinkingError('signed history belongs to a model outside the replay allowlist.');
-    }
     // Capturing Anthropic history happens before final model resolution. Keep
-    // unlisted unsigned models on their legacy path instead of rejecting them
-    // merely because another selector enabled native replay on this process.
-    return { ...params, messages: messages.map(m => {
-      if (!Object.hasOwn(m, 'nativeThinkingBlocks')) return m;
-      const { nativeThinkingBlocks: _blocks, ...legacy } = m;
-      return legacy;
-    }) };
+    // unlisted selectors on the exact feature-off path: foreign signature
+    // material is stripped rather than rejected, so mixed-provider histories
+    // cannot trip signed-batch validation or reach a verifying upstream.
+    return { ...params, messages: stripForeignSignedThinking(messages, mode) };
   }
   if (params.continuityTrail) throw thinkingError('native replay cannot be combined with reasoning prompt injection.');
   const scope = mode === 'signed' ? origin(params) : null;
   const verifiedKeys = [];
-  const normalized = normalizeSignedToolHistory(messages).map(m => {
+  // 'text' drops foreign signature material first so the unsigned flow below
+  // never treats another provider's batch as a signed-protocol message.
+  const stripped = mode === 'text' ? stripForeignSignedThinking(messages, mode) : messages;
+  const normalized = normalizeSignedToolHistory(stripped).map(m => {
     const blocks = blocksFor(m);
     if (!blocks.length) return m;
     if (m.role !== 'assistant' || blocks.length !== 1 || blocks[0]?.type !== 'thinking') {
@@ -120,17 +137,22 @@ export function prepareNativeThinking(params, now = Date.now(), { renew = true }
     if (Buffer.byteLength(block.thinking) + Buffer.byteLength(block.signature || '') > MAX_BYTES) throw thinkingError('history block exceeds the 2 MiB native thinking limit.');
     if (m.tool_calls?.length && !params.nativeToolCall) throw thinkingError('thinking tool history requires native tool calls.');
     const copy = { type: 'thinking', thinking: block.thinking };
-    if (block.signature) {
-      if (mode !== 'signed') throw thinkingError('signed history cannot be replayed by an unsigned model.');
+    if (block.signature && mode === 'signed') {
       const record = getRegistry().lookup(scope, block.thinking, block.signature, now);
       verifiedKeys.push(record.key);
       copy.signature = block.signature;
       copy.signatureType = record.type;
     }
-    return { ...m, nativeThinkingBlocks: [copy] };
+    const next = { ...m, nativeThinkingBlocks: [copy] };
+    // 'text' keeps the summary but drops the opaque signature for unsigned replay.
+    if (mode !== 'signed') delete next.reasoning_signature;
+    return next;
   });
   // Renew only after the entire history passes validation. Invalid batches cannot
   // extend retention for an otherwise valid prefix. Persist before dispatch.
+  // `renew` is false on the second call of the same attempt (adapter → wire
+  // builder): validation still runs, but the retention/alias writes already
+  // happened once and each is a full-file sync rewrite.
   if (renew && verifiedKeys.length) getRegistry().touch(verifiedKeys, now);
   return { ...params, messages: normalized };
 }

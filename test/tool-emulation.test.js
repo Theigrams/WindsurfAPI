@@ -915,6 +915,37 @@ describe('normalizeMessagesForCascade (preamble placement regression)', () => {
     assert.ok(asst.content.includes('"file_path":"x.md"'));
     assert.ok(!asst.content.includes('<arg_key>'));
   });
+
+  it('serializes signed-metadata assistant tool_calls identically to feature-off', () => {
+    // Cascade regression: a dead nativeStructured||nativeThinking guard left
+    // {content:null, tool_calls} raw, which client.js encoded as an empty
+    // assistant turn. The emulation path must ignore signature metadata.
+    const prev = process.env.DEVIN_CONNECT_NATIVE_THINKING;
+    process.env.DEVIN_CONNECT_NATIVE_THINKING = '1';
+    try {
+      const signed = [
+        { role: 'user', content: 'list files' },
+        { role: 'assistant', content: null, tool_calls: [
+          { id: 'c1', type: 'function', function: { name: 'ls', arguments: '{}' } },
+        ], nativeThinkingBlocks: [{ type: 'thinking', thinking: 'hmm', signature: 'foreign' }] },
+        { role: 'tool', tool_call_id: 'c1', content: 'a.txt' },
+        { role: 'user', content: 'ok' },
+      ];
+      const unsigned = signed.map(({ nativeThinkingBlocks: _b, ...m }) => m);
+      const opts = { modelKey: 'claude-sonnet-4', route: 'chat' };
+      const outSigned = normalizeMessagesForCascade(signed, tools, opts);
+      const outUnsigned = normalizeMessagesForCascade(unsigned, tools, opts);
+      assert.deepEqual(outSigned, outUnsigned);
+      const asst = outSigned.find(m => m.role === 'assistant');
+      assert.equal(typeof asst.content, 'string');
+      assert.ok(asst.content.includes('<tool_call>'), `expected serialized call, got: ${asst.content}`);
+      assert.ok(!('tool_calls' in asst), 'assistant message must not carry a tool_calls array');
+      assert.ok(!outSigned.some(m => m.nativeThinkingBlocks));
+    } finally {
+      if (prev === undefined) delete process.env.DEVIN_CONNECT_NATIVE_THINKING;
+      else process.env.DEVIN_CONNECT_NATIVE_THINKING = prev;
+    }
+  });
 });
 
 describe('repairToolCallArguments', () => {

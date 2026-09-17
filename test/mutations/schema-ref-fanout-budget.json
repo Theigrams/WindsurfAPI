@@ -3,7 +3,7 @@
     "test/tool-emulation-ref-fanout.test.js",
     "test/tool-emulation.test.js"
   ],
-  "expectBaselinePass": 88,
+  "expectBaselinePass": 89,
   "mutations": [
     {
       "name": "the original defect: cycle check only, no size bound at all (levels=20 -> 18193 ms / 61.9 MB)",
@@ -119,5 +119,6 @@
       "anchor": "    budget.exhausted = true;\n    return { type: 'object' };\n  }\n  budget.remaining--;",
       "replacement": "    budget.exhausted = true;\n    return { $ref: '#/$defs/truncated' };\n  }\n  budget.remaining--;"
     }
-  ]
+  ],
+  "_baseline_provenance": "Measured on Node 24.16.0 during functional integration stage 05, 2026-09-18: 89 passed, zero failed. Structured reporter, no forced exit."
 }

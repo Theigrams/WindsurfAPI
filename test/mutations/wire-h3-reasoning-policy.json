@@ -28,8 +28,8 @@
     {
       "name": "H3-M4: enable replay by default",
       "file": "src/devin-connect.js",
-      "anchor": "  const reasoningTagNum = replayTag === '1' ? 11 : (replayTag === '9' ? 9 : 0);",
-      "replacement": "  const reasoningTagNum = replayTag === '1' ? 11 : (replayTag === '9' ? 9 : 11);",
+      "anchor": "  const reasoningTagNum = nativeThinkingEnabled(env) ? 0 : (replayTag === '1' ? 11 : (replayTag === '9' ? 9 : 0));",
+      "replacement": "  const reasoningTagNum = nativeThinkingEnabled(env) ? 0 : (replayTag === '1' ? 11 : (replayTag === '9' ? 9 : 11));",
       "expectCaught": true
     },
     {

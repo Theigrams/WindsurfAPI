@@ -1,14 +1,14 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { nativeThinkingMode, prepareNativeThinking, nativeThinkingEvents, nativeSessionRole, nativeSessionHistory, __thinkingTesting } from '../src/devin-thinking.js';
+import { nativeThinkingMode, prepareNativeThinking, nativeThinkingEvents, nativeSessionRole, nativeSessionHistory, stripForeignSignedThinking, hasSignedThinking, __thinkingTesting } from '../src/devin-thinking.js';
 import { buildGetChatMessageRequest, decodeFrame, __setRequestImpl } from '../src/devin-connect.js';
 import { wrapEnvelope, endOfStreamEnvelope } from '../src/connect.js';
 import { getExperimental, setExperimental } from '../src/runtime-config.js';
 import { _resetForTests as resetSessions } from '../src/session-continuity.js';
 import { toChatCompletion, streamChatCompletion, __setStreamChatForTest } from '../src/devin-connect-openai.js';
 import { handleMessages } from '../src/handlers/messages.js';
-import { normalizeMessagesForCascade } from '../src/handlers/tool-emulation.js';
+import { normalizeMessagesForCascade, interleaveParallelToolMessages } from '../src/handlers/tool-emulation.js';
 import { parseFields, getAllFields, getField, writeStringField, writeMessageField, writeVarintField } from '../src/proto.js';
 
 // Structural unit fixtures only. Real opaque signatures are checked separately,
@@ -62,9 +62,6 @@ beforeEach(() => { saved = Object.fromEntries(Object.keys(env).map(k => [k, proc
 afterEach(() => { for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : process.env[k] = v; __setStreamChatForTest(null); __setRequestImpl(null); __thinkingTesting.clear(); });
 
 describe('Native thinking policy and wire fidelity', () => {
-  it('requires a nonempty caller scope for signed replay', () => {
-    assert.throws(() => prepareNativeThinking({ ...base, nativeThinkingScope: '' }), /explicit caller scope/);
-  });
   it('uses only internal role provenance for session matching without rewriting wire messages', async () => {
     let converted;
     await handleMessages({model:'swe-2-high',messages:[{role:'system',content:'reminder'},{role:'developer',content:[{type:'text',text:'developer'}]},{role:'user',content:'question',nativeSessionRole:'system'}]}, {handleChatCompletions:async b=>{converted=b.messages;return {status:200,body:{choices:[{message:{role:'assistant',content:'ok'}}]}};}});
@@ -116,12 +113,18 @@ describe('Native thinking policy and wire fidelity', () => {
     const rows = wire({ ...base, model: 'glm-5-2-max', messages: [1, 2, 3].map(i => ({ role: 'assistant', content: 'ok', reasoning_content: String(i) })) });
     assert.deepEqual(rows.map(r => str(r, 11)), ['1', '2', '3']);
   });
-  for (const [name, change] of Object.entries({ model: { model: 'swe-2-max' }, account: { token: 'account-b' }, session: { sessionId: 'b' }, caller: { nativeThinkingScope: 'b' } })) {
+  for (const [name, change] of Object.entries({ account: { token: 'account-b' }, session: { sessionId: 'b' }, caller: { nativeThinkingScope: 'b' } })) {
     it(`rejects signed replay across ${name}`, async () => {
       await collect(signedEvents());
       assert.throws(() => wire({ ...base, ...change, messages: [assistant()] }), /Native thinking/);
     });
   }
+  it('strips rather than rejects signed history replayed across model', async () => {
+    await collect(signedEvents());
+    const params = { ...base, model: 'swe-2-max', messages: [assistant()] };
+    const rows = wire(params);
+    assert.equal(str(rows[0], 11), undefined); assert.equal(str(rows[0], 12), undefined); assert.equal(str(rows[0], 18), undefined);
+  });
   it('rejects unknown, idle-expired and mutated signatures, and reloads saved provenance', async () => {
     const params = { ...base, messages: [assistant()] };
     assert.throws(() => prepareNativeThinking(params), /unknown/);
@@ -157,6 +160,11 @@ describe('Native thinking policy and wire fidelity', () => {
   it('rejects missing stable session and prompt injection', () => {
     assert.throws(() => prepareNativeThinking({ ...base, sessionId: '' }), /stable session/);
     assert.throws(() => prepareNativeThinking({ ...base, continuityTrail: 'checkpoint' }), /injection/);
+  });
+  it('rejects an empty caller scope in signed mode', () => {
+    // Direct-API misuse guard: an empty string scope must not silently become
+    // a shared origin bucket. HTTP callers always carry caller-key fallback.
+    assert.throws(() => prepareNativeThinking({ ...base, nativeThinkingScope: '' }), err => err.code === 'NATIVE_THINKING_INCOMPATIBLE');
   });
   it('rejects unsupported redacted and multiple thinking blocks', () => {
     for (const blocks of [[block(), block()], [{ type: 'redacted_thinking', data: 'opaque' }], [null]]) {
@@ -226,6 +234,89 @@ describe('Native thinking policy and wire fidelity', () => {
     assert.equal(rows.length, 6);
     assert.deepEqual(rows.filter(r => str(r, 7)).map(r => str(r, 3)), ['1-a', '1-b', '2-a', '2-b']);
     assert.deepEqual(rows.filter(r => str(r, 12)).map(r => getAllFields(r, 6).length), [2, 2]);
+  });
+});
+
+describe('Foreign signed thinking outside the replay allowlists', () => {
+  it('strips signed history for unlisted selectors instead of rejecting it', () => {
+    const params = { ...base, model: 'unlisted-model', messages: [
+      { ...assistant(), tool_calls: [tool('a'), tool('b')] },
+      { role: 'tool', tool_call_id: 'a', content: '7' },
+      { role: 'tool', tool_call_id: 'b', content: '8' },
+    ] };
+    const before = structuredClone(params);
+    const prepared = prepareNativeThinking(params);
+    assert.equal(prepared.messages[0].nativeThinkingBlocks, undefined);
+    const rows = wire(params);
+    assert.equal(str(rows[0], 11), undefined); assert.equal(str(rows[0], 12), undefined); assert.equal(str(rows[0], 18), undefined);
+    assert.deepEqual(params, before);
+  });
+  it('unlisted signed parallel history interleaves exactly like feature-off', () => {
+    const batch = { ...assistant(), tool_calls: [tool('a'), tool('b')] };
+    const results = [{ role: 'tool', tool_call_id: 'a', content: '7' }, { role: 'tool', tool_call_id: 'b', content: '8' }];
+    const stripped = stripForeignSignedThinking([batch, ...results], null);
+    assert.equal(hasSignedThinking(stripped[0]), false);
+    const out = interleaveParallelToolMessages(stripped);
+    assert.equal(out.filter(m => m.role === 'assistant').length, 2);
+    assert.deepEqual(out.filter(m => m.role === 'tool').map(m => m.tool_call_id), ['a', 'b']);
+  });
+  it('drops reasoning_signature for unlisted selectors so it never reaches the wire', () => {
+    const params = { ...base, model: 'unlisted-model', messages: [{ role: 'assistant', content: 'done', reasoning_content: thinking, reasoning_signature: signature }] };
+    const prepared = prepareNativeThinking(params);
+    assert.equal(prepared.messages[0].reasoning_content, thinking);
+    assert.equal(prepared.messages[0].reasoning_signature, undefined);
+    const rows = wire(params);
+    assert.equal(str(rows[0], 11), undefined); assert.equal(str(rows[0], 12), undefined);
+  });
+  it('replays signed history as unsigned text thinking on text selectors', () => {
+    const params = { ...base, model: 'glm-5-2-max', messages: [assistant()] };
+    const prepared = prepareNativeThinking(params);
+    assert.deepEqual(prepared.messages[0].nativeThinkingBlocks, [{ type: 'thinking', thinking }]);
+    const rows = wire(params);
+    assert.equal(str(rows[0], 11), thinking); assert.equal(str(rows[0], 12), undefined); assert.equal(str(rows[0], 18), undefined);
+  });
+  it('keeps strict registry validation for signed selectors', () => {
+    assert.throws(() => prepareNativeThinking({ ...base, messages: [assistant()] }), /SIGNATURE_UNKNOWN|unknown/);
+    const stripped = stripForeignSignedThinking([assistant()], 'signed');
+    assert.equal(hasSignedThinking(stripped[0]), true);
+  });
+  it('accepts foreign signed history on unlisted selectors through the full HTTP chain', async () => {
+    const flags = { DEVIN_CONNECT: '1', DEVIN_CONNECT_TOKEN: 'offline-foreign-sign' };
+    const old = Object.fromEntries(Object.keys(flags).map(k => [k, process.env[k]]));
+    const experimental = getExperimental();
+    Object.assign(process.env, flags); setExperimental({ nativeToolCall: true }); resetSessions();
+    const requests = [];
+    __setRequestImpl((_opts, cb) => {
+      const req = new EventEmitter(); req.destroyed = false; req.setTimeout = () => req;
+      req.write = data => requests.push(parseFields(data.subarray(5)));
+      req.destroy = () => { req.destroyed = true; };
+      req.end = () => {
+        const res = new EventEmitter(); res.statusCode = 200; cb(res);
+        setImmediate(() => {
+          const frames = [writeStringField(3, 'OK'), writeVarintField(5, 2)];
+          for (const frame of frames) { if (req.destroyed) return; res.emit('data', wrapEnvelope(frame, { compress: false })); }
+          res.emit('data', endOfStreamEnvelope()); res.emit('end');
+        });
+      };
+      return req;
+    });
+    try {
+      // A bigmodel-issued signed thinking turn replayed by the client must not
+      // 400 this gateway when the resolved selector is outside both allowlists.
+      const reply = await handleMessages({ model: 'swe-2-max', messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: [{ type: 'thinking', thinking, signature: 'foreign-provider-signature' }, { type: 'text', text: 'done' }] },
+        { role: 'user', content: 'next' },
+      ] }, { callerKey: 'foreign-mix' });
+      assert.equal(reply.status, 200, JSON.stringify(reply.body?.error));
+      assert.equal(requests.length, 1);
+      const rows = getAllFields(requests[0], 3).map(f => parseFields(f.value));
+      assert.equal(rows.some(r => getField(r, 12, 2)), false, 'no signature field may reach the wire');
+      assert.equal(rows.some(r => getField(r, 11, 2)), false, 'stripped thinking must not be replayed upstream');
+    } finally {
+      setExperimental(experimental); resetSessions();
+      for (const [k, v] of Object.entries(old)) v === undefined ? delete process.env[k] : process.env[k] = v;
+    }
   });
 });
 

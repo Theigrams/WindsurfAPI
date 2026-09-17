@@ -4,7 +4,7 @@
  */
 
 import { createHash, randomUUID } from 'crypto';
-import { nativeThinkingMode, nativeSessionHistory } from '../devin-thinking.js';
+import { nativeThinkingMode, nativeSessionHistory, stripForeignSignedThinking } from '../devin-thinking.js';
 import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
 import { getApiKey, acquireAccountByKey, releaseAccountById, currentApiKeyForId, getAccountAvailability, reportError, reportSuccess, markRateLimited, markQuotaExhausted, reportInternalError, reportDeadToken, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, isConnectSelectorBlockedByDrought, getDroughtSummary, reLoginAccount, getAccountCount, hasConnectEntitledAccount, recordAccountSpend, ensureDeviceSeed } from '../auth.js';
 import { isStickyEnabled, setStickyBinding, peekStickyBinding } from '../account/sticky-session.js';
@@ -2918,7 +2918,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
   // `gpt-5.5-xhigh`, not the medium-tier default.
   const reqModel = mergeReasoningEffortIntoModel(body.model, body);
   let messages = body.messages;
-  const callerKey = context.callerKey || body.__callerKey || '';
+  let callerKey = context.callerKey || body.__callerKey || '';
   const nativeBridgeCallerKey = context.nativeBridgeCallerKey || callerKey;
   const cachePolicy = body.__cachePolicy || null;
   // Cline compat layer active for this request? Resolved at the server edge
@@ -3376,14 +3376,19 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // silently falling back to prompt emulation.
     if (emulateTools) log.info(`Chat[${reqId}]: TOOLCALL nativeFlag=${nativeFlag} defsOn=${nativeDefsOn} callsOn=${nativeCallsOn} suppressPreamble=${suppressPreamble} mode=${(nativeDefsOn && nativeCallsOn) ? 'NATIVE' : 'emulation'}`);
     const nativeStructured = nativeDefsOn && nativeCallsOn;
-    if (nativeThinkingMode(selector) && emulateTools && !nativeStructured) {
+    const thinkingMode = nativeThinkingMode(selector);
+    // Signed selectors keep full history for registry validation; every other
+    // selector gets the exact feature-off shape before interleave/normalize,
+    // so foreign signed thinking cannot alter the wire or trip signed rules.
+    const strippedMessages = stripForeignSignedThinking(messages, thinkingMode);
+    if (thinkingMode && emulateTools && !nativeStructured) {
       return { status: 400, body: { error: { type: 'invalid_request_error', code: 'NATIVE_THINKING_INCOMPATIBLE', message: 'Native thinking requires native tool definitions and calls.' } } };
     }
     let connectMessages;
     try {
       connectMessages = emulateTools
-        ? normalizeMessagesForCascade(messages, connectTools, { modelKey: reqModelName, provider: null, route: 'devin_connect', toolChoice: tool_choice, injectUserPreamble: !suppressPreamble, stripOrphans: nativeDefsOn, nativeStructured })
-        : interleaveParallelToolMessages(messages);
+        ? normalizeMessagesForCascade(strippedMessages, connectTools, { modelKey: reqModelName, provider: null, route: 'devin_connect', toolChoice: tool_choice, injectUserPreamble: !suppressPreamble, stripOrphans: nativeDefsOn, nativeStructured })
+        : interleaveParallelToolMessages(strippedMessages);
     } catch (err) {
       if (err.code !== 'NATIVE_THINKING_INCOMPATIBLE') throw err;
       return { status: 400, body: { error: { type: 'invalid_request_error', code: err.code, message: err.message } } };
@@ -3552,7 +3557,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // In native thinking mode a signed batch stays atomic, but an unsigned batch
     // is interleaved on the wire. Matching that wire history against a committed
     // unsplit response would invent a new session and invalidate earlier signatures.
-    const connectSessionMessages = nativeThinkingMode(selector) ? nativeSessionHistory(messages) : connectMessages;
+    const connectSessionMessages = thinkingMode ? nativeSessionHistory(strippedMessages) : connectMessages;
     try {
       const connectSessionId = resolveConnectSessionId(callerKey || '', connectSessionMessages, connectSessionEnv);
       if (connectSessionId) {
@@ -4368,15 +4373,18 @@ async function _handleChatCompletionsInner(body, context = {}) {
   // those tool messages and assistant tool_calls entries from the cascade
   // message list so the planner only sees real human / assistant text plus
   // its trajectory inheritance — duplicate context would confuse it.
+  // Cascade never replays native thinking; drop signature metadata so history
+  // takes the exact feature-off shape regardless of DEVIN_CONNECT_NATIVE_THINKING.
+  const cascadeSource = stripForeignSignedThinking(messages, null);
   let cascadeMessages;
   if (nativeBridgeOn) {
-    cascadeMessages = (messages || []).filter(m => {
+    cascadeMessages = (cascadeSource || []).filter(m => {
       if (m?.role === 'tool') return false;
       if (m?.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length && !m.content) return false;
       return true;
     });
   } else if (emulateTools) {
-    cascadeMessages = normalizeMessagesForCascade(messages, effectiveTools, {
+    cascadeMessages = normalizeMessagesForCascade(cascadeSource, effectiveTools, {
       injectUserPreamble: !disableUserToolFallback,
       modelKey: routingModelKey,
       provider: modelInfo?.provider || null,
@@ -4389,7 +4397,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       toolChoice: tool_choice,
     });
   } else {
-    cascadeMessages = [...messages];
+    cascadeMessages = [...cascadeSource];
   }
   // Bundle the v2.0.65 native bridge handles into one opts object so we
   // can thread it through nonStreamResponse / streamResponse / cascadeChat

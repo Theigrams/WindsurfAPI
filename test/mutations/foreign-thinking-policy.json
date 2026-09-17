@@ -1,0 +1,26 @@
+{
+  "tests": [
+    "test/foreign-thinking-policy.test.js"
+  ],
+  "expectBaselinePass": 15,
+  "mutations": [
+    {
+      "name": "Legacy replay probe bypasses the native allowlist",
+      "file": "src/devin-connect.js",
+      "anchor": "  const reasoningTagNum = nativeThinkingEnabled(env) ? 0 : (replayTag === '1' ? 11 : (replayTag === '9' ? 9 : 0));",
+      "replacement": "  const reasoningTagNum = replayTag === '1' ? 11 : (replayTag === '9' ? 9 : 0);"
+    },
+    {
+      "name": "Rejects unlisted foreign signatures instead of stripping",
+      "file": "src/devin-thinking.js",
+      "anchor": "  if (!mode) {",
+      "replacement": "  if (!mode) {\n    if (messages.some(hasSignedThinking)) throw thinkingError('foreign signed history');"
+    },
+    {
+      "name": "Bypasses signed provenance lookup",
+      "file": "src/devin-thinking.js",
+      "anchor": "    if (block.signature && mode === 'signed') {",
+      "replacement": "    if (false) {"
+    }
+  ]
+}

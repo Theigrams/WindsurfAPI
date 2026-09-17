@@ -26,7 +26,7 @@
  * Zero npm deps. Nothing dials the network at import time.
  */
 
-import { nativeThinkingMode, prepareNativeThinking, thinkingError } from './devin-thinking.js';
+import { nativeThinkingEnabled, nativeThinkingMode, prepareNativeThinking, thinkingError } from './devin-thinking.js';
 import https from 'https';
 import { StringDecoder } from 'string_decoder';
 import { randomUUID, randomBytes, createHmac } from 'crypto';
@@ -1062,7 +1062,10 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
   // but does not consume them (0/3 effect). Kept as permanent gated RE probe tool.
   // Reference req022: genuine Bedrock/Claude client wire where #11 actually lives on assistant turns.
   const replayTag = String(env.DEVIN_CONNECT_REPLAY_REASONING || '').trim();
-  const reasoningTagNum = replayTag === '1' ? 11 : (replayTag === '9' ? 9 : 0);
+  // Native replay policy is authoritative while enabled: a legacy debugging
+  // probe must not reintroduce unsigned thinking for an unlisted selector.
+  // Listed selectors use their validated native blocks below.
+  const reasoningTagNum = nativeThinkingEnabled(env) ? 0 : (replayTag === '1' ? 11 : (replayTag === '9' ? 9 : 0));
 
   // System turns normally ride the dedicated system_prompt field (#2). The
   // opt-in collapse mode moves them into the next source=USER message instead,

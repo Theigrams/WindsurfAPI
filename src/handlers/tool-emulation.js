@@ -1393,7 +1393,7 @@ export function normalizeMessagesForCascade(messages, tools, options = {}) {
     }
 
     if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-      if (nativeStructured || (nativeThinkingEnabled() && (m.nativeThinkingBlocks?.length || m.reasoning_signature))) { out.push(m); continue; } // preserve metadata until attempt validation
+      if (nativeStructured) { out.push(m); continue; } // keep structured for native #6 encode
       const parts = [];
       if (m.content) parts.push(typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
       // Serialize past tool_calls back into the cascade history using the
