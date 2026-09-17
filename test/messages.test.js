@@ -638,11 +638,7 @@ describe('Anthropic messages request translation', () => {
     assert.ok(events.some(e => e.event === 'message_stop'), 'message_stop sent after [DONE]');
   });
 
-  // A1: message_start.usage must carry a non-zero local input estimate when the
-  // request has input — official SDKs read input_tokens from message_start and
-  // only accumulate output_tokens from message_delta, so an all-zero start made
-  // the SDK's final input read 0. message_delta must then only add output_tokens
-  // (input stays the authoritative upstream value) and never regress input to 0.
+  // Start usage is provisional; only message_delta contains final accounting.
   // #234 — message_start must announce the model that ACTUALLY ran.
   //
   // The translator is constructed with the REQUESTED name (it exists before the upstream
@@ -714,7 +710,7 @@ describe('Anthropic messages request translation', () => {
       'the first chunk wins; a later disagreeing chunk must not change it');
   });
 
-  it('prefills message_start.usage.input_tokens (>0) and lets message_delta carry authoritative usage (A1)', async () => {
+  it('starts with zero provisional usage and reports authoritative terminal usage', async () => {
     const result = await handleMessages({
       model: 'claude-sonnet-4.6',
       stream: true,
@@ -745,7 +741,7 @@ describe('Anthropic messages request translation', () => {
     // the non-stream response shape and official Anthropic message_start events.
     assert.equal(start.data.message.container, null, 'message_start.message.container is null (S1 shape alignment)');
     assert.ok('container' in start.data.message, 'container key present, not merely undefined');
-    assert.ok(start.data.message.usage.input_tokens > 0, 'message_start.usage.input_tokens is a non-zero local estimate');
+    assert.equal(start.data.message.usage.input_tokens, 0, 'start usage must not contain an estimate');
     assert.equal(start.data.message.usage.output_tokens, 0, 'message_start.usage.output_tokens starts at 0');
 
     // F6: a typed `event: ping` (data {"type":"ping"}) must follow message_start,
@@ -758,15 +754,13 @@ describe('Anthropic messages request translation', () => {
     const delta = events.find(e => e.event === 'message_delta');
     assert.ok(delta, 'message_delta emitted');
     // The delta carries the AUTHORITATIVE upstream numbers (prompt 42 → input 42,
-    // completion 7 → output 7), overriding the local start estimate.
+    // completion 7 → output 7), replacing the empty start baseline.
     assert.equal(delta.data.usage.input_tokens, 42, 'message_delta.usage.input_tokens is the authoritative upstream value');
     assert.equal(delta.data.usage.output_tokens, 7, 'message_delta.usage.output_tokens is the accumulated output');
   });
 
-  // A1 + cache: with a cache_control breakpoint and no upstream cache numbers,
-  // the local prefix estimate should already be visible in message_start (not
-  // only in the final delta), so SDKs budget cache from the very first event.
-  it('prefills message_start.usage.cache_creation from the local cache policy estimate (A1)', async () => {
+  // Cache policy estimates never become provisional or terminal cache writes.
+  it('does not bill a cache policy estimate in message_start', async () => {
     // Prefix must clear the C2 minimum cacheable size (~1024 tokens) for the
     // estimate to be emitted rather than floored to 0.
     const cachedPrefix = 'system prompt cached prefix. '.repeat(160);
@@ -795,7 +789,7 @@ describe('Anthropic messages request translation', () => {
     const events = parseAnthropicEvents(res.body);
 
     const start = events.find(e => e.event === 'message_start');
-    assert.ok(start.data.message.usage.cache_creation_input_tokens > 0, 'message_start prefills cache_creation from the local estimate');
+    assert.equal(start.data.message.usage.cache_creation_input_tokens, 0, 'start usage must not invent cache writes');
     assert.equal(
       start.data.message.usage.cache_creation_input_tokens,
       start.data.message.usage.cache_creation.ephemeral_5m_input_tokens,
@@ -805,7 +799,7 @@ describe('Anthropic messages request translation', () => {
 
   // G2: when the upstream never sends a usage object, output_tokens falls back to
   // 0 (we can't invent one) while input_tokens still reflects the local estimate
-  // rather than regressing to 0 — the delta stays consistent with message_start.
+  // at completion. The start event itself has no measured input yet.
   it('falls back to the local input estimate (output_tokens 0) when upstream omits usage (A1/G2)', async () => {
     const result = await handleMessages({
       model: 'claude-sonnet-4.6',
@@ -831,9 +825,9 @@ describe('Anthropic messages request translation', () => {
 
     const start = events.find(e => e.event === 'message_start');
     const delta = events.find(e => e.event === 'message_delta');
-    assert.ok(start.data.message.usage.input_tokens > 0, 'message_start has a non-zero local input estimate');
+    assert.equal(start.data.message.usage.input_tokens, 0, 'start has no measured input');
     // No upstream usage → delta reuses the same local input estimate, output 0.
-    assert.equal(delta.data.usage.input_tokens, start.data.message.usage.input_tokens, 'message_delta input matches the local start estimate (no regression to 0)');
+    assert.ok(delta.data.usage.input_tokens > 0, 'missing final input retains compatibility estimate only at completion');
     assert.equal(delta.data.usage.output_tokens, 0, 'output_tokens falls back to 0 when upstream omits usage (G2)');
   });
 
@@ -1209,7 +1203,7 @@ describe('Anthropic messages request translation', () => {
     assert.match(text, /document: report/, 'undecoded PDF becomes a labeled placeholder, not empty');
   });
 
-  it('B2: keeps an image sub-block in tool_result content as a placeholder, not empty', async () => {
+  it('B2: preserves an image sub-block in tool_result content as real image data', async () => {
     const captured = await captureBody({
       model: 'claude-sonnet-4.6',
       messages: [
@@ -1225,8 +1219,10 @@ describe('Anthropic messages request translation', () => {
       ],
     });
     const toolMsg = captured.messages.find(m => m.role === 'tool');
-    assert.match(toolMsg.content, /here is the screen/, 'text sub-block preserved');
-    assert.match(toolMsg.content, /\[image: image\/png\]/, 'image sub-block is not flattened to empty');
+    assert.deepEqual(toolMsg.content, [
+      { type: 'text', text: 'here is the screen' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+    ]);
   });
 
   it('F1: passes top_k through to the converted chat body', async () => {

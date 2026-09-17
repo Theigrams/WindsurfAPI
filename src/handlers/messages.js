@@ -335,13 +335,8 @@ function extractCachePolicy(body, promptEstimate = null) {
   // CJK-aware token estimate (reusing estimateTextTokens / anthropicBlockTokens
   // so the weighting matches count_tokens), and snapshot the cumulative total
   // at the DEEPEST breakpoint — that prefix is what gets written to cache on a
-  // first-seen turn. buildAnthropicUsage emits it as cache_creation_input_tokens
-  // ONLY when upstream supplied no real cache numbers.
-  // (unverified: this is a local estimate — true cache tokens need a paid
-  //  account to calibrate against; see PAID ledger task E. We attribute the
-  //  whole prefix to creation and leave cache_read to genuine upstream values,
-  //  since detecting a real cross-turn hit needs a stateful tracker we
-  //  deliberately don't build here.)
+  // first-seen turn. This remains a policy estimate for request handling;
+  // it is never emitted as measured cache usage.
   let runningTokens = 0;
   let estCacheCreationTokens = 0;
   // C6: split the cumulative prefix per TTL instead of collapsing everything to
@@ -424,10 +419,8 @@ function extractCachePolicy(body, promptEstimate = null) {
   // It cannot leak downstream: anthropicToOpenAI builds an explicit request
   // object and never spreads the raw body.
   //
-  // C2: expose the model's minimum cacheable prefix so buildAnthropicUsage can
-  // floor the EMITTED cache_creation to 0 when the estimated prefix is below it
-  // (Anthropic writes no cache entry under the minimum). We keep the raw prefix
-  // estimate here — the floor is a billing/emission concern applied at output.
+  // Retain the model threshold as request policy metadata. Token estimates
+  // and thresholds do not establish that a cache entry was written.
   const minCacheablePrefix = minCacheablePrefixTokens(body?.model);
   return { has1h, breakpointCount, estCacheCreationTokens, est5mTokens, est1hTokens, minCacheablePrefix };
 }
@@ -543,11 +536,6 @@ function normalizeImageBlock(block) {
   return null;
 }
 
-// B2: flatten an array of tool_result content sub-blocks to a string WITHOUT
-// dropping non-text blocks. The old `b.text || ''` join silently collapsed
-// image sub-blocks to empty; here they become an explicit placeholder so the
-// model still knows an image was returned. Real forwarding of tool_result
-// images needs the gated vision path — TODO(PAID-1).
 /**
  * Wrap a DECODED document block's text so its provenance survives translation.
  *
@@ -585,6 +573,29 @@ function flattenContentBlocks(blocks) {
     }
   }
   return parts.join('\n');
+}
+
+// Tool screenshots must remain structured image parts until the backend encodes
+// them. Flattening to "[image: ...]" loses pixels while leaving a successful reply.
+// Keep the existing string representation for text-only results.
+function normalizeToolResultContent(content, annotationOptions) {
+  if (!Array.isArray(content) || !content.some(block => block?.type === 'image')) {
+    const text = typeof content === 'string' ? content
+      : Array.isArray(content) ? flattenContentBlocks(content) : JSON.stringify(content);
+    return annotateRiskyReadToolResult(text, annotationOptions);
+  }
+  const parts = content.map(block => {
+    if (block?.type === 'image') {
+      const normalized = normalizeImageBlock(block);
+      if (normalized) return normalized;
+    }
+    return { type: 'text', text: flattenContentBlocks([block]) };
+  });
+  // Apply Read safeguards to the combined text, preserving image order/data.
+  const text = parts.filter(part => part.type === 'text').map(part => part.text).join('\n');
+  const annotated = annotateRiskyReadToolResult(text, annotationOptions);
+  if (annotated !== text) parts.push({ type: 'text', text: annotated.slice(text.length).replace(/^\n+/, '') });
+  return parts;
 }
 
 // ─── Anthropic → OpenAI request translation ──────────────────
@@ -705,13 +716,7 @@ function anthropicToOpenAI(body, ccActive = false, promptEstimate = null) {
             function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
           });
         } else if (block.type === 'tool_result') {
-          // B2: flatten sub-blocks without dropping non-text (image) blocks.
-          let content = typeof block.content === 'string'
-            ? block.content
-            : Array.isArray(block.content)
-              ? flattenContentBlocks(block.content)
-              : JSON.stringify(block.content);
-          content = annotateRiskyReadToolResult(content, {
+          const content = normalizeToolResultContent(block.content, {
             toolName: toolNameById.get(block.tool_use_id),
             isError: !!block.is_error,
           });
@@ -865,17 +870,11 @@ export function openAIToAnthropic(result, model, msgId, cachePolicy = null, stop
   const choice = result.choices?.[0];
   const usage = result.usage || {};
   const content = [];
-  if (choice?.message?.reasoning_content) {
-    // Anthropic thinking blocks may carry an opaque encrypted `signature` that
-    // the *real* Anthropic server decrypts on multi-turn replay. Our upstream
-    // (Devin #9 / Cascade) never emits one, so when it is missing we omit the
-    // field entirely rather than emitting an empty-string placeholder — some
-    // strict clients (e.g. Grok Build's messages backend) reject `signature: ""`
-    // as a missing/invalid value. If upstream ever supplies a real signature we
-    // forward it (forward-compat for a future thinking/paid model).
+  if (choice?.message?.reasoning_content || choice?.message?.reasoning_signature) {
+    // Preserve real opaque signatures; omit the field for unsigned providers.
     const thinkingBlock = {
       type: 'thinking',
-      thinking: choice.message.reasoning_content,
+      thinking: choice.message.reasoning_content || '',
     };
     if (choice.message.reasoning_signature) {
       thinkingBlock.signature = choice.message.reasoning_signature;
@@ -951,16 +950,9 @@ export function openAIToAnthropic(result, model, msgId, cachePolicy = null, stop
 // the local policy tells us the TTL, we attribute the whole creation count
 // to the 5m bucket since that's the spec default.
 //
-// cachePolicy (optional) carries the LOCAL prefix estimate from
-// extractCachePolicy. When the request had cache_control breakpoints but the
-// upstream reported NO cache tokens (DEVIN_CONNECT free tier never does), we
-// fall back to that estimate so Claude Code sees a non-zero, deterministic
-// cache_creation_input_tokens instead of a misleading 0 — otherwise the client
-// concludes caching never engaged and mis-budgets context. We only substitute
-// when upstream gave nothing; a real upstream number always wins. The estimate
-// goes to creation (first-seen prefix), TTL-split per breakpoint (C6).
-// (unverified: local estimate — true cache token values require a paid account
-//  to calibrate; see PAID ledger task E.)
+// Cache policy supplies TTL attribution only. A requested cache breakpoint is
+// not evidence that the upstream created a cache entry. Never turn a local
+// token estimate into billed cache usage, including when fields are missing.
 function buildAnthropicUsage(usage, cachePolicy = null) {
   const cacheRead = usage.cache_read_input_tokens
     ?? usage.prompt_tokens_details?.cached_tokens
@@ -982,61 +974,9 @@ function buildAnthropicUsage(usage, cachePolicy = null) {
       ? { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: cacheCreationFlat }
       : { ephemeral_5m_input_tokens: cacheCreationFlat, ephemeral_1h_input_tokens: 0 };
   }
-  // Local-estimate fallback: only when the request marked a cacheable prefix
-  // AND upstream surfaced no cache tokens at all (both creation and read are 0).
-  const upstreamGaveCache = cacheCreationFlat > 0 || cacheRead > 0;
-  let usedEstimate = false;
-  // C2: below the model's minimum cacheable prefix Anthropic writes no cache
-  // entry, so a sub-threshold local estimate must emit 0 creation rather than a
-  // phantom count. Only gates the LOCAL-estimate fallback — a real upstream
-  // number is authoritative regardless of our floor.
-  const minPrefix = cachePolicy?.minCacheablePrefix ?? 0;
-  const estAboveFloor = (cachePolicy?.estCacheCreationTokens ?? 0) >= minPrefix;
-  if (!upstreamGaveCache && cachePolicy?.breakpointCount > 0
-      && cachePolicy.estCacheCreationTokens > 0 && estAboveFloor) {
-    usedEstimate = true;
-    cacheCreationFlat = cachePolicy.estCacheCreationTokens;
-    // B7: clamp the estimate to the total prompt — the estimate and promptTotal
-    // share the same口径 (both from estimateRequestPromptTokens), so the prefix
-    // can never legitimately exceed the whole prompt. Defends against skew.
-    if (promptTotal > 0) cacheCreationFlat = Math.min(cacheCreationFlat, promptTotal);
-    // C6: use the per-TTL prefix estimate from extractCachePolicy so a mixed
-    // 5m+1h request buckets each prefix segment to its own TTL, instead of the
-    // old has1h binary that dumped everything into one bucket. est5m + est1h ==
-    // estCacheCreationTokens, so scale by the clamp ratio to preserve the sum.
-    const est5m = cachePolicy.est5mTokens ?? 0;
-    const est1h = cachePolicy.est1hTokens ?? 0;
-    const estTotal = est5m + est1h;
-    if (estTotal > 0) {
-      const scale = cacheCreationFlat / estTotal;
-      const scaled1h = Math.round(est1h * scale);
-      split = {
-        ephemeral_5m_input_tokens: cacheCreationFlat - scaled1h,
-        ephemeral_1h_input_tokens: scaled1h,
-      };
-    } else {
-      // No per-TTL detail (older policy shape) — fall back to has1h routing.
-      split = cachePolicy.has1h
-        ? { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: cacheCreationFlat }
-        : { ephemeral_5m_input_tokens: cacheCreationFlat, ephemeral_1h_input_tokens: 0 };
-    }
-  }
-  // v2.0.68 (#118): Anthropic semantics for input_tokens DIFFER from OpenAI.
-  // OpenAI: prompt_tokens = freshInput + cacheRead (cached_tokens is a subset;
-  //         cache_creation ships SEPARATELY, not inside prompt_tokens).
-  // Anthropic: input_tokens = freshInput ONLY; cache_read_input_tokens and
-  //            cache_creation_input_tokens are siblings (mutually exclusive).
-  // Real upstream path (chat.js buildUsageBody): prompt_tokens already excludes
-  // cache_creation, so freshInput = promptTotal - cacheRead is correct and we
-  // must NOT subtract creation again.
-  // B6: the LOCAL-estimate fallback path is different — promptTotal there is the
-  // whole-request estimate that INCLUDES the cacheable prefix now counted in
-  // cacheCreationFlat. Subtract it too so the three buckets
-  // (input / cache_creation / cache_read) are mutually exclusive and don't
-  // double-count the prefix. Negative values clamp to 0 (defensive).
-  const freshInput = usedEstimate
-    ? Math.max(0, promptTotal - cacheRead - cacheCreationFlat)
-    : Math.max(0, promptTotal - cacheRead);
+  // Connect prompt_tokens includes fresh input and cache reads; cache writes
+  // are reported separately by normalizeConnectUsage.
+  const freshInput = Math.max(0, promptTotal - cacheRead);
   return {
     input_tokens: freshInput,
     output_tokens: usage.completion_tokens || usage.output_tokens || 0,
@@ -1064,18 +1004,10 @@ class AnthropicStreamTranslator {
     // caller threads them in — log fields only, no behavior.
     this.reqId = reqId;
     this.conversationId = conversationId;
-    // Local cache-prefix estimate from extractCachePolicy; used by finish() to
-    // fill cache_creation_input_tokens when upstream reports none (see
-    // buildAnthropicUsage). null when the request had no cache_control markers.
+    // Request cache policy supplies TTL attribution for measured writes.
     this.cachePolicy = cachePolicy;
-    // A1: LOCAL prompt-token estimate (estimateRequestPromptTokens口径, identical
-    // to count_tokens) used to PREFILL message_start.usage.input_tokens / cache_*
-    // instead of the all-zero placeholder Anthropic's own server never sends.
-    // Official SDKs read input_tokens from message_start and only accumulate
-    // output_tokens from message_delta; a zero here made their final input read
-    // 0. This is an ESTIMATE (true input needs the upstream, surfaced in the
-    // authoritative message_delta.usage which overrides it). 0 when no body was
-    // available to estimate (falls back to the old all-zero start).
+    // Compatibility fallback at completion only, if upstream input is missing.
+    // It is never used for provisional usage or cache read/write accounting.
     this.inputEstimate = inputEstimate;
     // Current content block: null | { type, index }
     // type: 'text' | 'thinking' | 'tool_use'
@@ -1129,15 +1061,10 @@ class AnthropicStreamTranslator {
   startMessage() {
     if (this.messageStarted) return;
     this.messageStarted = true;
-    // A1: prefill message_start.usage with the LOCAL input/cache estimate rather
-    // than all-zero. We route the estimate through buildAnthropicUsage with a
-    // synthetic upstream-usage object (only prompt_tokens known; no upstream
-    // output/cache-read yet) so the input_tokens / cache_creation split uses the
-    // exact same口径 as the final message_delta — the delta later overrides this
-    // with the authoritative upstream numbers. output_tokens stays 0 at start and
-    // is accumulated by the client from subsequent message_delta events.
-    // (estimate — true input_tokens require the upstream; see buildAnthropicUsage.)
-    const startUsage = buildAnthropicUsage({ prompt_tokens: this.inputEstimate }, this.cachePolicy);
+    // No upstream usage is known yet. Some relays retain nonzero start values
+    // when the final delta contains zero, so provisional estimates corrupt
+    // billing even when the terminal event is correct. Emit an empty baseline.
+    const startUsage = buildAnthropicUsage({});
     this.send('message_start', {
       type: 'message_start',
       message: {
@@ -1459,7 +1386,7 @@ class AnthropicStreamTranslator {
     // A1/G2: the final message_delta carries the AUTHORITATIVE upstream usage.
     // When the upstream supplied prompt/input tokens, they win. When it did NOT
     // (G2 — DEVIN_CONNECT free tier often omits usage entirely), fall back to the
-    // same LOCAL input estimate we already surfaced in message_start so the delta
+    // LOCAL input estimate at completion so the delta
     // doesn't clobber the client's input_tokens back to 0. output_tokens keeps
     // its || 0 fallback (G2: reasonable — we can't invent an output count the
     // upstream never reported).
@@ -1627,14 +1554,9 @@ export async function handleMessages(body, context = {}) {
   const ccActive = !!context.ccCompat?.active;
   const promptEstimate = { tokens: 0 };
   const openaiBody = anthropicToOpenAI(body, ccActive, promptEstimate);
-  // anthropicToOpenAI attaches __cachePolicy only when the request carried
-  // cache_control breakpoints; reuse it for the local cache-token estimate.
+  // Request cache policy is used only for TTL attribution of measured writes.
   const cachePolicy = openaiBody.__cachePolicy || null;
-  // A1: LOCAL prompt-token estimate over the original Anthropic body, same口径
-  // as count_tokens (estimateRequestPromptTokens). Used to prefill the streaming
-  // message_start.usage so official SDKs read a non-zero input_tokens there
-  // instead of the old all-zero placeholder. (cache_control deletion inside
-  // anthropicToOpenAI does not affect this count.)
+  // Final input compatibility fallback; count_tokens uses the same estimator.
   // The prefix walk already computed the count_tokens total over the
   // original content. Reuse that number instead of revisiting every string.
   const inputEstimate = promptEstimate.tokens;
@@ -1843,7 +1765,7 @@ function anthropicBlockTokens(block) {
 // Shared LOCAL prompt-token estimate over an Anthropic request body: the system
 // prompt, every message's content blocks, and tool schemas — all weighted with
 // the same CJK-aware estimateTextTokens used everywhere else. Both count_tokens
-// (below) and the streaming message_start prefill (A1) call this so the two
+// (below) and the final missing-input fallback call this so the two
 // paths always report the SAME estimate口径. Returns the raw sum (no Math.max
 // floor) so callers can decide their own flooring.
 function estimateRequestPromptTokens(body) {
