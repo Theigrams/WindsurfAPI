@@ -3,7 +3,8 @@
  * Routes to RawGetChatMessage (legacy) or Cascade (premium) based on model type.
  */
 
-import { nativeThinkingMode, nativeSessionHistory } from '../devin-thinking.js';
+import { nativeThinkingMode, nativeSessionHistory, resolveMessagesNativeScope } from '../devin-thinking.js';
+import { identityDiagnostic } from '../messages-identity.js';
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
 import { getApiKey, acquireAccountByKey, releaseAccountById, currentApiKeyForId, getAccountAvailability, reportError, reportSuccess, markRateLimited, markQuotaExhausted, reportInternalError, reportDeadToken, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, isConnectSelectorBlockedByDrought, getDroughtSummary, reLoginAccount, getAccountCount, hasConnectEntitledAccount, recordAccountSpend, ensureDeviceSeed } from '../auth.js';
@@ -60,7 +61,7 @@ import { resolveConnectSelector } from '../devin-connect-models.js';
 import { isRetryable as isConnectRetryable, getToolDefTags, parseToolCallTagMap } from '../devin-connect.js';
 import { isRouterModel, assignModel as _assignModel } from '../devin-connect-catalog.js';
 import { bumpConnect } from '../devin-connect-metrics.js';
-import { resolveSessionId as resolveConnectSessionId, commitAfterResponse as commitConnectSession, getSessionModelConfig as getSessionConnectModelConfig, getSessionReasoningTrail as getSessionConnectReasoningTrail, getSessionEnvForModel } from '../session-continuity.js';
+import { resolveSessionId as resolveConnectSessionId, commitAfterResponse as commitConnectSession, getSessionModelConfig as getSessionConnectModelConfig, getSessionReasoningTrail as getSessionConnectReasoningTrail, getSessionEnvForModel, sessionMatchDiagnostic } from '../session-continuity.js';
 import { newTraceId, traceClientRequest, traceRouting, traceClientResponse, traceEnabled } from '../trace.js';
 import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
 import {
@@ -2884,7 +2885,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
   // `gpt-5.5-xhigh`, not the medium-tier default.
   const reqModel = mergeReasoningEffortIntoModel(body.model, body);
   let messages = body.messages;
-  const callerKey = context.callerKey || body.__callerKey || '';
+  let callerKey = context.callerKey || body.__callerKey || '';
   const nativeBridgeCallerKey = context.nativeBridgeCallerKey || callerKey;
   const cachePolicy = body.__cachePolicy || null;
   // Cline compat layer active for this request? Resolved at the server edge
@@ -3488,8 +3489,20 @@ async function _handleChatCompletionsInner(body, context = {}) {
         };
       }
     }
+    const nativeIdentity = nativeThinkingMode(selector) === 'signed' ? context.messagesIdentity : null;
+    let identitySelection;
+    if (nativeIdentity) {
+      try {
+        identitySelection = resolveMessagesNativeScope(nativeIdentity, connectMessages);
+        callerKey = identitySelection.scope;
+      } catch (err) {
+        if (!['NATIVE_THINKING_STORAGE_ERROR', 'NATIVE_THINKING_INCOMPATIBLE'].includes(err.code)) throw err;
+        const mappedError = connectErrorToHttp(err.code);
+        return { status: mappedError.status, body: { error: { type: mappedError.type, code: err.code, message: err.message } } };
+      }
+    }
     const ccAcct = await acquireConnectAccount(context.signal, callerKey, selector);
-    const connectParams = { messages: connectMessages, model: selector, nativeThinkingScope: callerKey || '' };
+    const connectParams = { messages: connectMessages, model: selector, nativeThinkingScope: callerKey || '', ...(nativeIdentity ? { messagesIdentity: nativeIdentity } : {}) };
     // Session continuity (opt-in, DEVIN_CONNECT_SESSION_REUSE, default OFF). Derive
     // a stable protobuf session_id (#16) from the conversation's completed request/
     // response pair chain so a multi-turn dialog reuses ONE session_id instead of
@@ -3520,6 +3533,8 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // unsplit response would invent a new session and invalidate earlier signatures.
     const connectSessionMessages = nativeThinkingMode(selector) ? nativeSessionHistory(messages) : connectMessages;
     try {
+      if (nativeIdentity) log.info('Messages native identity', identityDiagnostic(nativeIdentity, callerKey, identitySelection.reason,
+        sessionMatchDiagnostic(callerKey, connectSessionMessages, connectSessionEnv)));
       const connectSessionId = resolveConnectSessionId(callerKey || '', connectSessionMessages, connectSessionEnv);
       if (connectSessionId) {
         connectParams.sessionId = connectSessionId;

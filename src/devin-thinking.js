@@ -1,9 +1,11 @@
 // Opt-in native Devin thinking. Opaque signatures are never interpreted or minted.
 import fs from 'node:fs';
 import path from 'node:path';
-import { config } from './config.js';
+import { config, log } from './config.js';
 import { NativeThinkingRegistry, nativeOrigin, MAX_NATIVE_RECORDS } from './native-thinking-registry.js';
 import { NATIVE_RETENTION_MS } from './native-thinking-storage.js';
+import { createHash } from 'node:crypto';
+import { messagesIdentityAliases, identityDiagnostic } from './messages-identity.js';
 
 const registryFile = path.join(config.dataDir, 'native-thinking-signatures.json');
 let registry;
@@ -38,6 +40,18 @@ function blocksFor(message) {
 }
 export function hasSignedThinking(message) {
   return message?.role === 'assistant' && blocksFor(message).some(b => b?.signature);
+}
+
+export function resolveMessagesNativeScope(identity, messages, aliases = messagesIdentityAliases()) {
+  const signatures = messages.filter(m => m?.role === 'assistant').flatMap(blocksFor)
+    .map(b => b?.signature).filter(s => typeof s === 'string' && s);
+  if (!signatures.length) return { scope: identity.stableScope, reason: 'stable' };
+  const candidates = [...new Set([identity.stableScope, identity.legacyScope, ...aliases.candidates(identity)])];
+  const callers = getRegistry().callersForSignatures(signatures);
+  const matching = candidates.filter(scope => callers.has(createHash('sha256').update(scope).digest('hex')));
+  if (matching.length > 1) throw thinkingError('ambiguous messages identity; continue with the original client context.');
+  const scope = matching[0] || identity.stableScope;
+  return { scope, reason: !matching.length ? 'unregistered-scope' : scope === identity.stableScope ? 'stable' : scope === identity.legacyScope ? 'legacy-candidate' : 'verified-alias' };
 }
 function validateParallelCallIds(calls) {
   const ids = calls.map(tc => tc?.id);
@@ -132,6 +146,12 @@ export function prepareNativeThinking(params, now = Date.now()) {
   // Renew only after the entire history passes validation. Invalid batches cannot
   // extend retention for an otherwise valid prefix. Persist before dispatch.
   if (verifiedKeys.length) getRegistry().touch(verifiedKeys, now);
+  // The candidate scope was selected before account/session resolution. Learn
+  // it ONLY after every history block has passed the original strict checks.
+  if (verifiedKeys.length && params.messagesIdentity) {
+    messagesIdentityAliases().confirm(params.messagesIdentity, params.nativeThinkingScope, now);
+    log.debug('Messages native identity verified', identityDiagnostic(params.messagesIdentity, params.nativeThinkingScope, 'history-verified', 'validated'));
+  }
   return { ...params, messages: normalized };
 }
 

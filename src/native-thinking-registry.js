@@ -37,6 +37,18 @@ export class NativeThinkingRegistry {
     writeNativeState(this.file, { entries: [...next.values()] });
     this.records = next;
   }
+  // Routing hint only. Full model/account/session/summary/type/expiry validation
+  // still occurs in lookup before dispatch; this never authorizes a replay.
+  callersForSignatures(signatures) {
+    const wanted = new Set(signatures.map(hash));
+    const seen = new Map();
+    for (const r of this.records.values()) {
+      if (!wanted.has(r.signature)) continue;
+      if (!seen.has(r.caller)) seen.set(r.caller, new Set());
+      seen.get(r.caller).add(r.signature);
+    }
+    return new Set([...seen].filter(([, found]) => found.size === wanted.size).map(([caller]) => caller));
+  }
   lookup(origin, thinking, signature, now) {
     const id = identity(origin, thinking, signature), key = digest(id);
     const record = this.records.get(key);

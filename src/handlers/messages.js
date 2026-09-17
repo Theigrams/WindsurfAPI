@@ -11,8 +11,10 @@
  * No buffering, so first-token latency matches the upstream Cascade stream.
  */
 
-import { createHash, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
 import { nativeThinkingEnabled, nativeSessionRole } from '../devin-thinking.js';
+import { extractCallerSubKey, messagesIdentity } from '../messages-identity.js';
+export { extractCallerSubKey } from '../messages-identity.js';
 import { handleChatCompletions, connectErrorToHttp } from './chat.js';
 import { log } from '../config.js';
 import { leakTraceEnabled, thinkMarkersIn, leakSample } from '../leak-trace.js';
@@ -227,35 +229,6 @@ function convertServerSideTool(t) {
     };
   }
   return null;
-}
-
-function sha256Hex(value) {
-  return createHash('sha256').update(String(value || '')).digest('hex');
-}
-
-// Real Claude Code 2.1.120 traffic carries metadata.user_id as a
-// JSON-encoded string with shape {device_id, account_uuid, session_id}.
-// Older Anthropic SDK clients send a plain string. The proxy currently
-// derives callerKey from API key + IP/UA, which means every Claude Code
-// client behind the same key shares one cascade pool — leading to cross-
-// device session bleed. Extract a stable per-user tag from metadata so
-// the pool can isolate concurrent users.
-export function extractCallerSubKey(body) {
-  const userId = body?.metadata?.user_id;
-  if (typeof userId !== 'string' || !userId) return '';
-  let parsed = null;
-  try { parsed = JSON.parse(userId); } catch {}
-  let tag = '';
-  if (parsed && typeof parsed === 'object') {
-    tag = parsed.device_id || parsed.deviceId
-      || parsed.session_id || parsed.sessionId
-      || parsed.account_uuid || parsed.accountUuid
-      || '';
-  } else {
-    tag = userId;
-  }
-  if (!tag) return '';
-  return sha256Hex(tag).slice(0, 16);
 }
 
 // Anthropic prompt caching (`cache_control`) — verified spec:
@@ -1536,7 +1509,7 @@ export async function handleMessages(body, context = {}) {
   // do not send metadata.user_id keep the original callerKey unchanged.
   const subKey = extractCallerSubKey(body);
   const alreadyUserScoped = context.callerKey && context.callerKey.includes(':user:');
-  const effectiveContext = (subKey && !alreadyUserScoped)
+  let effectiveContext = (subKey && !alreadyUserScoped)
     ? {
         ...context,
         callerKey: `${context.callerKey || ''}:user:${subKey}`,
@@ -1545,6 +1518,9 @@ export async function handleMessages(body, context = {}) {
           : context.nativeBridgeCallerKey,
       }
     : context;
+  // Internal context only: client-supplied __fields never enable migration.
+  // Non-native routes retain the legacy caller and bridge scope above.
+  effectiveContext = { ...effectiveContext, messagesIdentity: messagesIdentity(body, context.callerKey) };
   // T2: the captured incoming thinking rides the body as __incomingThinking
   // (single __-prefixed carrier, same convention as __route); chat.js reads it
   // as a fallback continuity-store source when the outbound response has none.

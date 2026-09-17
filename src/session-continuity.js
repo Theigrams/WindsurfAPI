@@ -603,6 +603,15 @@ function findExistingState(scopeId, analysis, env, outSeen = null) {
   return (best && !hasTie) ? { state: best, viaRoot: false } : null;
 }
 
+// Describe the existing matcher without creating state or renewing retention.
+// Root compaction fallback happens later, so "unmatched" does not imply new.
+export function sessionMatchDiagnostic(callerKey, messages, env = process.env) {
+  if (!isSessionReuseEnabled(env)) return 'disabled';
+  const scopeId = deriveScopeId(callerKey);
+  const found = findExistingState(scopeId, analyzeHistory(canonicalize(messages), scopeId), env);
+  return found ? (found.viaRoot ? 'root' : 'history') : 'unmatched';
+}
+
 /**
  * ModelConfig for the current request: stable per-session config UUID (#15.1)
  * and 1-based turn counter (#15.2), mirroring genuine devin.exe wire behaviour.
