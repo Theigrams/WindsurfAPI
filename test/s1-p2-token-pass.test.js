@@ -69,6 +69,7 @@ function messagesHarness({ baseline = false, poisonIterator = false } = {}) {
       randomUUID: () => '00000000-0000-4000-8000-000000000000',
       genMsgId: () => 'msg_synthetic',
       neutralizeClientIdentity: text => text,
+      nativeThinkingEnabled: () => false,
       SERVER_SIDE_ANTHROPIC_TOOL_TYPES: new Set(),
       convertServerSideTool: () => null,
       normalizeImageBlock: block => ({ type: 'image_url', image_url: { url: block.source?.data || '' } }),

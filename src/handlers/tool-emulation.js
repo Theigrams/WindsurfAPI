@@ -22,6 +22,7 @@
  */
 
 import { log } from '../config.js';
+import { nativeThinkingEnabled, hasSignedThinking, normalizeSignedToolHistory } from '../devin-thinking.js';
 
 // "<workspace>" you may see is a redaction marker, NOT a literal path.
 // Issue #98 (nalayahfowlkest-ship-it): `find <workspace> -type f` was
@@ -1169,6 +1170,9 @@ export function interleaveParallelToolMessages(messages) {
   while (i < messages.length) {
     const m = messages[i];
     if (m?.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      // Signed assistant batches remain atomic; the native encoder writes all
+      // calls on that message and emits the opaque signature exactly once.
+      if (nativeThinkingEnabled() && hasSignedThinking(m)) { out.push(m); i++; continue; }
       let j = i;
       const assistantMsgs = [];
       const strayTexts = [];
@@ -1239,6 +1243,8 @@ export function interleaveParallelToolMessages(messages) {
             if (!first) {
               delete singleAssistant.reasoning_content;
               delete singleAssistant.reasoning;
+              delete singleAssistant.nativeThinkingBlocks;
+              delete singleAssistant.reasoning_signature;
             }
             out.push(singleAssistant);
 
@@ -1281,10 +1287,13 @@ export function normalizeMessagesForCascade(messages, tools, options = {}) {
   if (!Array.isArray(messages)) return messages;
   // Devin Connect & Cascade multi-turn: when nativeStructured mode is engaged
   // (native #10 ToolDef + #6 ChatToolCall on DEVIN_CONNECT), the upstream gRPC
-  // state machine requires tool_calls and results to be interleaved per turn.
+  // legacy path interleaves tool_calls and results per turn. Signed native turns
+  // instead retain one assistant with repeated calls and one signature, followed
+  // by the matching results; splitting would change the signed message boundary.
   // In text-emulation mode (nativeStructured: false, e.g. Kimi dialect),
   // dialect-specific batch formatters handle batch history.
   if (options.nativeStructured === true) {
+    if (nativeThinkingEnabled()) messages = normalizeSignedToolHistory(messages);
     messages = interleaveParallelToolMessages(messages);
   }
   // Orphan-stripping is OPT-IN (options.stripOrphans) — NOT the default. Doing it
@@ -1384,7 +1393,7 @@ export function normalizeMessagesForCascade(messages, tools, options = {}) {
     }
 
     if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-      if (nativeStructured) { out.push(m); continue; } // keep structured for native #6 encode
+      if (nativeStructured || (nativeThinkingEnabled() && (m.nativeThinkingBlocks?.length || m.reasoning_signature))) { out.push(m); continue; } // preserve metadata until attempt validation
       const parts = [];
       if (m.content) parts.push(typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
       // Serialize past tool_calls back into the cascade history using the

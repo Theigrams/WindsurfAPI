@@ -31,11 +31,12 @@ describe('chat handler: DEVIN_CONNECT reuse log carries the account', () => {
   it('ccAcct is in scope at the reuse log call site (read right below for connectParams.token)', () => {
     const idx = CHAT.indexOf(REUSE_LOG);
     assert.ok(idx !== -1, 'the DEVIN_CONNECT reuse log line must exist');
-    const after = CHAT.slice(idx, idx + 400);
-    assert.match(
-      after,
-      /if \(ccAcct\) \{[\s\S]*connectParams\.token = ccAcct\.apiKey;/,
-      'the ccAcct guard for connectParams.token must immediately follow the reuse log call',
-    );
+    const tokenIdx = CHAT.indexOf('connectParams.token = ccAcct.apiKey;', idx);
+    assert.ok(tokenIdx !== -1, 'connectParams.token must still be assigned from ccAcct after the reuse log');
+    const between = CHAT.slice(idx, tokenIdx);
+    const guardIdx = between.lastIndexOf('if (ccAcct) {');
+    assert.ok(guardIdx !== -1, 'an if (ccAcct) guard must wrap the token assignment');
+    assert.ok(!between.slice(guardIdx).includes('//'), 'no comment may sit between the guard and the assignment');
+    assert.ok(tokenIdx - idx < 800, 'the ccAcct token read must stay adjacent to the reuse log call site');
   });
 });

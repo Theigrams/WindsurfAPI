@@ -1,0 +1,27 @@
+{
+  "tests": [
+    "test/native-session-capacity.test.js"
+  ],
+  "expectBaselinePass": 7,
+  "_baseline_provenance": "7 capacity and restart regressions measured on Node 24.16.0 on 2026-09-18; fixture fills the real 10000-entry native cap.",
+  "mutations": [
+    {
+      "name": "Native admission ignores its capacity including legacy promotion",
+      "file": "src/session-continuity.js",
+      "anchor": "  const victims = new Set(capacityVictims({ ...env, __nativeThinkingPersistence: true }, state.stateId));",
+      "replacement": "  const victims = new Set();"
+    },
+    {
+      "name": "Legacy admission counts both pools and evicts native sessions",
+      "file": "src/session-continuity.js",
+      "anchor": "Boolean(s.nativeRetentionMs) === native",
+      "replacement": "true"
+    },
+    {
+      "name": "Native victims are evicted before the durable write succeeds",
+      "file": "src/session-continuity.js",
+      "anchor": "  const durableState = { ...state, nativeRetentionMs: NATIVE_RETENTION_MS };",
+      "replacement": "  for (const id of victims) evictState(id);\n  const durableState = { ...state, nativeRetentionMs: NATIVE_RETENTION_MS };"
+    }
+  ]
+}

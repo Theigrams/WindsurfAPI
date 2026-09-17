@@ -1,0 +1,14 @@
+{
+  "tests": [
+    "test/native-thinking-adapter-fidelity.test.js"
+  ],
+  "expectBaselinePass": 1,
+  "mutations": [
+    {
+      "name": "Signed streaming tool args pass through the legacy Cline repair shim",
+      "file": "src/devin-connect-openai.js",
+      "anchor": "arguments: compatArgs(tc.argumentsJson, !nativeMode && clineCompat)",
+      "replacement": "arguments: compatArgs(tc.argumentsJson, clineCompat)"
+    }
+  ]
+}

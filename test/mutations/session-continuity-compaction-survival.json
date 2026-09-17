@@ -3,7 +3,7 @@
     "test/session-continuity.test.js",
     "test/chat-reuse-log.test.js"
   ],
-  "expectBaselinePass": 51,
+  "expectBaselinePass": 52,
   "mutations": [
     {
       "name": "root fallback fires even when pair evidence exists — a live session gets re-associated through the root",
@@ -20,9 +20,9 @@
     {
       "name": "TTL eviction skipped in the root fallback — an evicted state resurrects through compaction survival",
       "file": "src/session-continuity.js",
-      "anchor": "        if (now - state.lastSeen > ttl) { evictState(stateId); continue; }",
+      "anchor": "        if (now - state.lastSeen > stateTtl(state, ttl)) { evictState(stateId); continue; }",
       "replacement": "        if (false) { evictState(stateId); continue; }"
     }
   ],
-  "_baseline_provenance": "Measured on Node 24.16.0 during functional integration stage 02, 2026-09-18: 51 passed, zero failed. Structured reporter, no forced exit."
+  "_baseline_provenance": "Measured on Node 24.16.0 during functional integration stage 04, 2026-09-18: 52 passed, zero failed. Structured reporter, no forced exit."
 }

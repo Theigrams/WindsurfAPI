@@ -2,16 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { config } from '../src/config.js';
+import { readNativeState, writeNativeState, nativeStorageError, NATIVE_RETENTION_MS } from '../src/native-thinking-storage.js';
 
 function load() {
   const source = readFileSync(new URL('../src/session-continuity.js', import.meta.url), 'utf8')
-    .replace("import crypto from 'crypto';", '').replace(/^export /gm, '');
+    .replace(/^import .*;$/gm, '').replace(/^export /gm, '');
   const env = { DEVIN_CONNECT_SESSION_REUSE: '1', DEVIN_CONNECT_SESSION_MAX_STATES: '3' };
-  return new Function('crypto', 'process', 'Date', 'setInterval', `${source}\nreturn {
+  return new Function('crypto', 'process', 'Date', 'setInterval', 'fs', 'path', 'config', 'readNativeState', 'writeNativeState', 'nativeStorageError', 'NATIVE_RETENTION_MS', `${source}\nreturn {
     commitAfterResponse, resolveSessionId, statesById, pairIndex, commitIndex,
     evictState, clearExpired, buildPairHashes, canonicalize, analyzeHistory,
     deriveScopeId, findExistingState
-  };`)(crypto, { env }, { now: () => 1000 }, () => ({ unref() {} }));
+  };`)(crypto, { env }, { now: () => 1000 }, () => ({ unref() {} }), fs, path, config, readNativeState, writeNativeState, nativeStorageError, NATIVE_RETENTION_MS);
 }
 function pair(i, prefix = '') {
   return [{ role: 'user', content: `${prefix}question-${i}` },

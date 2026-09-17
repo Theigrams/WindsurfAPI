@@ -8,7 +8,7 @@
     {
       "name": "call site removed — the normalizer stops interleaving parallel tool history, so a batched assistant turn encodes as consecutive role=2 frames and upstream 500/529s the whole session (the defect PR #261 fixes)",
       "file": "src/handlers/tool-emulation.js",
-      "anchor": "  if (options.nativeStructured === true) {\n    messages = interleaveParallelToolMessages(messages);\n  }",
+      "anchor": "  if (options.nativeStructured === true) {\n    if (nativeThinkingEnabled()) messages = normalizeSignedToolHistory(messages);\n    messages = interleaveParallelToolMessages(messages);\n  }",
       "replacement": "  if (false) {\n    messages = interleaveParallelToolMessages(messages);\n  }"
     },
     {

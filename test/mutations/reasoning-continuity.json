@@ -6,7 +6,7 @@
     "test/devin-connect-openai.test.js",
     "test/session-continuity-commit-fallback.test.js"
   ],
-  "expectBaselinePass": 318,
+  "expectBaselinePass": 319,
   "mutations": [
     {
       "name": "T1 store: the overlap-target commit path stops saving the reasoning tail",
@@ -75,5 +75,5 @@
       "replacement": "if (!Number.isFinite(n) || n < 0) return 4000;"
     }
   ],
-  "_baseline_provenance": "Measured on Node 24.16.0 during functional integration stage 02, 2026-09-18: 318 passed, zero failed. Structured reporter, no forced exit."
+  "_baseline_provenance": "Measured on Node 24.16.0 during functional integration stage 04, 2026-09-18: 319 passed, zero failed. Structured reporter, no forced exit."
 }

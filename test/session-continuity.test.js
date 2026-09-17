@@ -798,4 +798,20 @@ describe('session-continuity: index ownership across a rolling window', () => {
     assert.equal(resolveSessionId('caller-shared', [...secondHistory, { role: 'user', content: 'follow up' }], ENV), secondCommit,
       'and it still resolves through its own pair window');
   });
+
+  it('native signed sessions are not bounded by the legacy max-states cap', () => {
+    _resetForTests();
+    const base = { DEVIN_CONNECT_SESSION_REUSE: '1', DEVIN_CONNECT_SESSION_MAX_STATES: '2',
+      DEVIN_CONNECT_NATIVE_THINKING: '1', DEVIN_CONNECT_NATIVE_THINKING_SIGNED_MODELS: 'swe-2-high' };
+    const nativeEnv = getSessionEnvForModel('swe-2-high', base);
+    // Three distinct native conversations: each would previously 503 once the
+    // shared 500-cap filled with non-evictable native states; now the legacy
+    // cap of 2 must not touch them.
+    for (const n of [1, 2, 3]) {
+      assert.doesNotThrow(() => resolveSessionId(`caller-native-${n}`, [{ role: 'user', content: `native dialog ${n}` }], nativeEnv));
+    }
+    assert.equal(_getStoreSize(), 3, 'native states are not bounded by DEVIN_CONNECT_SESSION_MAX_STATES');
+    assert.doesNotThrow(() => resolveSessionId('caller-legacy', [{ role: 'user', content: 'a legacy dialog' }], base));
+    _resetForTests();
+  });
 });

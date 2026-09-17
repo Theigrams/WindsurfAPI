@@ -24,10 +24,14 @@
  *   - Idempotent commits (same state → same stateId)
  */
 import crypto from 'crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { config } from './config.js';
+import { readNativeState, writeNativeState, nativeStorageError, NATIVE_RETENTION_MS } from './native-thinking-storage.js';
 
 // ─── Configuration ─────────────────────────────────────────────────────────
 
-const SECRET = crypto.randomBytes(32);
+let SECRET = crypto.randomBytes(32);
 const DEFAULT_TTL = 30 * 60 * 1000;
 const DEFAULT_MAX_STATES = 500;
 const PAIR_WINDOW_SIZE = 10;
@@ -52,6 +56,49 @@ const commitIndex = new Map();     // commitKey → stateId
 // touches its own keys instead of scanning the (unbounded) whole index.
 const ownedIndexKeys = new Map();
 
+// Persist only native signed-session identifiers and hashes. Text drift fallback
+// records and reasoning tails intentionally remain memory-only.
+const nativeSessionFile = path.join(config.dataDir, 'native-thinking-sessions.json');
+let nativeSessionsLoaded = false;
+const nativeFields = ['stateId', 'scopeId', 'sessionId', 'pairWindow', 'lastSeen', 'commitKey', 'dialogAnchor', 'rootKey', 'configId', 'turnCount', 'nativeRetentionMs'];
+function loadNativeSessions() {
+  if (nativeSessionsLoaded || process.env.DEVIN_CONNECT_NATIVE_THINKING !== '1') return;
+  const saved = readNativeState(nativeSessionFile);
+  if (saved) {
+    if (!/^[0-9a-f]{64}$/.test(saved.secret || '') || !Array.isArray(saved.states) || saved.states.length > MAX_NATIVE_SESSION_STATES || saved.states.some(s =>
+      !s || !['stateId', 'scopeId', 'sessionId', 'configId'].every(k => typeof s[k] === 'string' && s[k].length > 0 && s[k].length < 128) ||
+      !Array.isArray(s.pairWindow) || s.pairWindow.length > PAIR_WINDOW_SIZE || s.pairWindow.some(h => !/^[0-9a-f]{64}$/.test(h)) ||
+      !Number.isFinite(s.lastSeen) || !Number.isInteger(s.turnCount) || s.turnCount < 0 ||
+      (s.rootKey != null && (typeof s.rootKey !== 'string' || !s.rootKey.startsWith(s.scopeId + ':'))) ||
+      (s.commitKey != null && !/^[0-9a-f]{64}$/.test(s.commitKey)))) throw nativeStorageError('invalid session metadata');
+    SECRET = Buffer.from(saved.secret, 'hex');
+    for (const raw of saved.states) {
+      if (Date.now() - raw.lastSeen >= NATIVE_RETENTION_MS) continue;
+      const state = { ...Object.fromEntries(nativeFields.map(k => [k, raw[k]])), nativeRetentionMs: NATIVE_RETENTION_MS, pairRecords: [], reasoningTails: [] };
+      statesById.set(state.stateId, state);
+      indexState(state.stateId, state);
+      if (state.rootKey) linkPairIndex(state.stateId, state.rootKey);
+      if (state.commitKey) { commitIndex.set(state.commitKey, state.stateId); ownIndexKey(state.stateId, state.commitKey); }
+    }
+  }
+  nativeSessionsLoaded = true;
+}
+function persistNativeSession(state, env) {
+  if (!env.__nativeThinkingPersistence && !state.nativeRetentionMs) return;
+  // Promotion is admission too. Prepare the bounded durable snapshot first;
+  // a failed write must not evict another live signed conversation in memory.
+  const victims = new Set(capacityVictims({ ...env, __nativeThinkingPersistence: true }, state.stateId));
+  const durableState = { ...state, nativeRetentionMs: NATIVE_RETENTION_MS };
+  writeNativeState(nativeSessionFile, { secret: SECRET.toString('hex'), states: [...statesById.values()]
+    .filter(s => !victims.has(s.stateId))
+    .map(s => s === state ? durableState : s)
+    .filter(s => s.nativeRetentionMs && Date.now() - s.lastSeen < s.nativeRetentionMs)
+    .map(s => Object.fromEntries(nativeFields.map(k => [k, s[k]]))) });
+  state.nativeRetentionMs = NATIVE_RETENTION_MS;
+  for (const id of victims) evictState(id);
+}
+const stateTtl = (state, ttl) => state.nativeRetentionMs || ttl;
+
 export function isSessionReuseEnabled(env = process.env) {
   const v = String(env.DEVIN_CONNECT_SESSION_REUSE ?? '').trim().toLowerCase();
   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
@@ -61,7 +108,8 @@ export function isSessionReuseEnabled(env = process.env) {
 export function getSessionEnvForModel(model, env = process.env) {
   const models = String(env.DEVIN_CONNECT_SESSION_MODELS || '').split(',').map(s => s.trim()).filter(Boolean);
   if (!models.length || models.includes(model)) {
-    return env;
+    const signed = env.DEVIN_CONNECT_NATIVE_THINKING === '1' && String(env.DEVIN_CONNECT_NATIVE_THINKING_SIGNED_MODELS || '').split(',').map(s => s.trim()).includes(model);
+    return signed ? { ...env, __nativeThinkingPersistence: true, DEVIN_CONNECT_SESSION_TTL_MS: NATIVE_RETENTION_MS } : env;
   }
   return { ...env, DEVIN_CONNECT_SESSION_REUSE: '0' };
 }
@@ -69,6 +117,7 @@ export function getSessionEnvForModel(model, env = process.env) {
 // ─── Canonicalizer ─────────────────────────────────────────────────────────
 
 function deriveScopeId(callerKey) {
+  loadNativeSessions();
   return crypto.createHmac('sha256', SECRET).update(callerKey || '').digest('hex');
 }
 
@@ -389,21 +438,32 @@ function evictState(stateId) {
   statesById.delete(stateId);
 }
 
+// Native signed sessions are capped separately from the short-lived legacy
+// states so a long-lived signed history cannot starve unrelated models.
+// Reaching the native cap evicts the least recently used signed session.
+export const MAX_NATIVE_SESSION_STATES = 10000;
+function capacityVictims(env, incomingId = null) {
+  const native = Boolean(env.__nativeThinkingPersistence);
+  const max = native ? MAX_NATIVE_SESSION_STATES : getMaxStates(env);
+  const pool = [...statesById].filter(([id, s]) => id !== incomingId && Boolean(s.nativeRetentionMs) === native);
+  if (pool.length < max) return [];
+  pool.sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+  // Only the incoming pool may evict. Also handle an operator lowering the
+  // legacy limit below the current size, not just the exactly-full case.
+  return pool.slice(0, pool.length - max + 1).map(([id]) => id);
+}
 function enforceCapacity(env) {
-  const max = getMaxStates(env);
-  if (statesById.size < max) return;
-  let oldest = null; let oldestTs = Infinity;
-  for (const [id, s] of statesById) {
-    if (s.lastSeen < oldestTs) { oldestTs = s.lastSeen; oldest = id; }
-  }
-  if (oldest) evictState(oldest);
+  // Native admission/eviction is committed by persistNativeSession, after its
+  // atomic disk write. Legacy states remain memory-only.
+  if (env.__nativeThinkingPersistence) return;
+  for (const id of capacityVictims(env)) evictState(id);
 }
 
 function clearExpired(env) {
   const ttl = getTtl(env);
   const now = Date.now();
   for (const [id, s] of statesById) {
-    if (now - s.lastSeen > ttl) evictState(id);
+    if (now - s.lastSeen > stateTtl(s, ttl)) evictState(id);
   }
 }
 
@@ -550,7 +610,7 @@ function findExistingState(scopeId, analysis, env, outSeen = null) {
     if (existing) {
       for (const sid of existing) {
         const state = statesById.get(sid);
-        if (state && now - state.lastSeen < ttl) return { state, viaRoot: true };
+        if (state && now - state.lastSeen < stateTtl(state, ttl)) return { state, viaRoot: true };
         // Expired — evict so it doesn't block future lookups
         evictState(sid);
       }
@@ -569,7 +629,7 @@ function findExistingState(scopeId, analysis, env, outSeen = null) {
       if (seen.has(stateId)) continue;
       seen.add(stateId);
       const state = statesById.get(stateId);
-      if (!state || now - state.lastSeen > ttl) continue;
+      if (!state || now - state.lastSeen > stateTtl(state, ttl)) continue;
       let score = overlapScore(hashes, state.pairWindow);
       // Drift fallback
       if (score === 0 && state.pairRecords?.length) {
@@ -653,6 +713,7 @@ export function resolveSessionId(callerKey, messages, env = process.env) {
       found.state.pairWindow = newWindow;
       found.state.pairRecords = postBarrierRecords.slice(-PAIR_WINDOW_SIZE);
     }
+    persistNativeSession(found.state, env);
     return found.state.sessionId;
   }
 
@@ -663,12 +724,14 @@ export function resolveSessionId(callerKey, messages, env = process.env) {
     // the opener is empty. Two dialogs with an identical opener share this id until
     // they diverge; commitAfterResponse then forks them (provisional-claim rule).
     const rootKey = rootAnchorKey(scopeId, analysis) || `${scopeId}:__no_pair__`;
+    clearExpired(env);
     enforceCapacity(env);
     const sessionId = crypto.randomUUID();
     const stateId = crypto.randomUUID();
     const state = { stateId, scopeId, sessionId, pairWindow: [], pairRecords: [], lastSeen: now, commitKey: null, dialogAnchor: null, rootKey, configId: crypto.randomUUID(), turnCount: 0, reasoningTails: [] };
     statesById.set(stateId, state);
     linkPairIndex(stateId, rootKey);
+    persistNativeSession(state, env);
     return sessionId;
   }
 
@@ -690,7 +753,7 @@ export function resolveSessionId(callerKey, messages, env = process.env) {
       for (const stateId of rootSet) {
         const state = statesById.get(stateId);
         if (!state) continue;
-        if (now - state.lastSeen > ttl) { evictState(stateId); continue; }
+        if (now - state.lastSeen > stateTtl(state, ttl)) { evictState(stateId); continue; }
         live.push(state);
       }
       if (live.length === 1) {
@@ -700,6 +763,7 @@ export function resolveSessionId(callerKey, messages, env = process.env) {
         state.pairWindow = newWindow;
         indexState(state.stateId, state);
         state.pairRecords = postBarrierRecords.slice(-PAIR_WINDOW_SIZE);
+        persistNativeSession(state, env);
         return state.sessionId;
       }
     }
@@ -716,6 +780,7 @@ export function resolveSessionId(callerKey, messages, env = process.env) {
   const state = { stateId, scopeId, sessionId, pairWindow, pairRecords: postBarrierRecords.slice(-PAIR_WINDOW_SIZE), lastSeen: now, commitKey: null, dialogAnchor, configId: crypto.randomUUID(), turnCount: 0, reasoningTails: [] };
   statesById.set(stateId, state);
   indexState(stateId, state);
+  persistNativeSession(state, env);
   return sessionId;
 }
 
@@ -744,8 +809,9 @@ export function commitAfterResponse(callerKey, messagesWithResponse, env = proce
   const existingId = commitIndex.get(commitKey);
   if (existingId) {
     const existing = statesById.get(existingId);
-    if (existing && now - existing.lastSeen < ttl) {
+    if (existing && now - existing.lastSeen < stateTtl(existing, ttl)) {
       existing.lastSeen = now;
+      persistNativeSession(existing, env);
       return existing.sessionId;
     }
   }
@@ -761,7 +827,7 @@ export function commitAfterResponse(callerKey, messagesWithResponse, env = proce
       if (seen.has(stateId)) continue;
       seen.add(stateId);
       const state = statesById.get(stateId);
-      if (!state || now - state.lastSeen > ttl) continue;
+      if (!state || now - state.lastSeen > stateTtl(state, ttl)) continue;
       const score = overlapScore(hashes, state.pairWindow);
       if (score > 0) { target = { state, stateId }; break; }
     }
@@ -779,6 +845,7 @@ export function commitAfterResponse(callerKey, messagesWithResponse, env = proce
     commitIndex.set(commitKey, target.stateId);
     ownIndexKey(target.stateId, commitKey);
     indexState(target.stateId, target.state);
+    persistNativeSession(target.state, env);
     return target.state.sessionId;
   }
 
@@ -793,7 +860,7 @@ export function commitAfterResponse(callerKey, messagesWithResponse, env = proce
     if (rootCandidates) {
       for (const sid of rootCandidates) {
         const state = statesById.get(sid);
-        if (!state || now - state.lastSeen > ttl) continue;
+        if (!state || now - state.lastSeen > stateTtl(state, ttl)) continue;
         if (state.pairWindow.length > 0) continue; // already claimed by another dialog
         state.lastSeen = now;
         state.pairWindow = pairWindow;
@@ -805,6 +872,7 @@ export function commitAfterResponse(callerKey, messagesWithResponse, env = proce
         commitIndex.set(commitKey, sid);
         ownIndexKey(sid, commitKey);
         indexState(sid, state);
+        persistNativeSession(state, env);
         return state.sessionId;
       }
     }
@@ -828,6 +896,7 @@ export function commitAfterResponse(callerKey, messagesWithResponse, env = proce
   ownIndexKey(stateId, commitKey);
   indexState(stateId, state);
   if (rootKey) linkPairIndex(stateId, rootKey);
+  persistNativeSession(state, env);
   return sessionId;
 }
 
@@ -838,11 +907,13 @@ if (_cleanupInterval.unref) _cleanupInterval.unref();
 
 // ─── Test Helpers ──────────────────────────────────────────────────────────
 
-export function _resetForTests() {
+export function _resetForTests({ memoryOnly = false } = {}) {
   statesById.clear();
   pairIndex.clear();
   commitIndex.clear();
   ownedIndexKeys.clear();
+  nativeSessionsLoaded = false;
+  if (!memoryOnly) { try { fs.unlinkSync(nativeSessionFile); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
 }
 
 export function _getStoreSize() {

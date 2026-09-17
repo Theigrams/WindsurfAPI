@@ -4,6 +4,7 @@
  */
 
 import { createHash, randomUUID } from 'crypto';
+import { nativeThinkingMode, nativeSessionHistory } from '../devin-thinking.js';
 import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
 import { getApiKey, acquireAccountByKey, releaseAccountById, currentApiKeyForId, getAccountAvailability, reportError, reportSuccess, markRateLimited, markQuotaExhausted, reportInternalError, reportDeadToken, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, isConnectSelectorBlockedByDrought, getDroughtSummary, reLoginAccount, getAccountCount, hasConnectEntitledAccount, recordAccountSpend, ensureDeviceSeed } from '../auth.js';
 import { isStickyEnabled, setStickyBinding, peekStickyBinding } from '../account/sticky-session.js';
@@ -516,6 +517,8 @@ export function connectErrorToHttp(code) {
     // auth or account fault). 400 invalid_request_error is the honest surface — the
     // caller must change the prompt, not retry or re-auth. NO account penalty.
     case 'CONTENT_BLOCKED': return { status: 400, type: 'invalid_request_error' };
+    case 'NATIVE_THINKING_INCOMPATIBLE': return { status: 400, type: 'invalid_request_error' };
+    case 'NATIVE_THINKING_STORAGE_ERROR': return { status: 503, type: 'api_error' };
     case 'NO_TOKEN': return { status: 401, type: 'authentication_error' };
     case 'TIMEOUT': return { status: 504, type: 'timeout_error' };
     // Absolute wall-clock deadline (upstream hung the full window). Same 504
@@ -2530,6 +2533,9 @@ export function finalizeConnectAccount(acct, { model, selector = null, startTime
     // prompt the caller sent; a single such request used to cascade the whole pool
     // to "exhausted (dead session tokens)". Release cleanly, exactly like a success.
     else if (err.code === 'CONTENT_BLOCKED') { /* no penalty — request content rejected, not an account fault */ }
+    else if (err.code === 'NATIVE_THINKING_INCOMPATIBLE' || err.code === 'NATIVE_THINKING_STORAGE_ERROR') {
+      // Local provenance validation/storage is not an upstream account fault.
+    }
     else if (err.code === 'ERR_CONNECT_ACCOUNT_HOST_NOT_ALLOWED') {
       // The account's stored apiServerUrl was refused by the allow-list before any
       // upstream call (DEVIN_CONNECT_ACCOUNT_HOST=1 path). The upstream never saw
@@ -3370,9 +3376,18 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // silently falling back to prompt emulation.
     if (emulateTools) log.info(`Chat[${reqId}]: TOOLCALL nativeFlag=${nativeFlag} defsOn=${nativeDefsOn} callsOn=${nativeCallsOn} suppressPreamble=${suppressPreamble} mode=${(nativeDefsOn && nativeCallsOn) ? 'NATIVE' : 'emulation'}`);
     const nativeStructured = nativeDefsOn && nativeCallsOn;
-    let connectMessages = emulateTools
-      ? normalizeMessagesForCascade(messages, connectTools, { modelKey: reqModelName, provider: null, route: 'devin_connect', toolChoice: tool_choice, injectUserPreamble: !suppressPreamble, stripOrphans: nativeDefsOn, nativeStructured })
-      : interleaveParallelToolMessages(messages);
+    if (nativeThinkingMode(selector) && emulateTools && !nativeStructured) {
+      return { status: 400, body: { error: { type: 'invalid_request_error', code: 'NATIVE_THINKING_INCOMPATIBLE', message: 'Native thinking requires native tool definitions and calls.' } } };
+    }
+    let connectMessages;
+    try {
+      connectMessages = emulateTools
+        ? normalizeMessagesForCascade(messages, connectTools, { modelKey: reqModelName, provider: null, route: 'devin_connect', toolChoice: tool_choice, injectUserPreamble: !suppressPreamble, stripOrphans: nativeDefsOn, nativeStructured })
+        : interleaveParallelToolMessages(messages);
+    } catch (err) {
+      if (err.code !== 'NATIVE_THINKING_INCOMPATIBLE') throw err;
+      return { status: 400, body: { error: { type: 'invalid_request_error', code: err.code, message: err.message } } };
+    }
     // HYBRID native path: DEVIN_CONNECT has no proto tool_calling_section
     // slot, so the description-only preamble (buildToolPreambleForProto with
     // nativeStructured:true) is never built by normalizeMessagesForCascade —
@@ -3508,7 +3523,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       }
     }
     const ccAcct = await acquireConnectAccount(context.signal, callerKey, selector);
-    const connectParams = { messages: connectMessages, model: selector };
+    const connectParams = { messages: connectMessages, model: selector, nativeThinkingScope: callerKey || '' };
     // Session continuity (opt-in, DEVIN_CONNECT_SESSION_REUSE, default OFF). Derive
     // a stable protobuf session_id (#16) from the conversation's completed request/
     // response pair chain so a multi-turn dialog reuses ONE session_id instead of
@@ -3533,14 +3548,25 @@ async function _handleChatCompletionsInner(body, context = {}) {
       }
     }
     const connectSessionEnv = getSessionEnvForModel(selector);
-    const connectSessionId = resolveConnectSessionId(callerKey || '', connectMessages, connectSessionEnv);
-    if (connectSessionId) {
-      connectParams.sessionId = connectSessionId;
-      const modelCfg = getSessionConnectModelConfig(callerKey || '', connectMessages, connectSessionEnv);
-      if (modelCfg) connectParams.sessionModelConfig = { id: modelCfg.configId, turn: modelCfg.turn };
-      const reasoningTrail = getSessionConnectReasoningTrail(callerKey || '', connectMessages, connectSessionEnv);
-      if (reasoningTrail) connectParams.continuityTrail = reasoningTrail;
-      log.info(`Chat[${reqId}]: DEVIN_CONNECT session reuse active → session_id=${connectSessionId}${modelCfg ? ` model_config=stable turn=${modelCfg.turn}` : ''} acct=${ccAcct?.account?.id || 'env-token'}`);
+    // Session identity follows client turns, not transport-specific tool splitting.
+    // In native thinking mode a signed batch stays atomic, but an unsigned batch
+    // is interleaved on the wire. Matching that wire history against a committed
+    // unsplit response would invent a new session and invalidate earlier signatures.
+    const connectSessionMessages = nativeThinkingMode(selector) ? nativeSessionHistory(messages) : connectMessages;
+    try {
+      const connectSessionId = resolveConnectSessionId(callerKey || '', connectSessionMessages, connectSessionEnv);
+      if (connectSessionId) {
+        connectParams.sessionId = connectSessionId;
+        const modelCfg = getSessionConnectModelConfig(callerKey || '', connectSessionMessages, connectSessionEnv);
+        if (modelCfg) connectParams.sessionModelConfig = { id: modelCfg.configId, turn: modelCfg.turn };
+        const reasoningTrail = getSessionConnectReasoningTrail(callerKey || '', connectSessionMessages, connectSessionEnv);
+        if (reasoningTrail && !nativeThinkingMode(selector)) connectParams.continuityTrail = reasoningTrail;
+        log.info(`Chat[${reqId}]: DEVIN_CONNECT session reuse active → session_id=${connectSessionId}${modelCfg ? ` model_config=stable config_id=${modelCfg.configId} turn=${modelCfg.turn}` : ''} acct=${ccAcct?.account?.id || 'env-token'}`);
+      }
+    } catch (err) {
+      if (err.code !== 'NATIVE_THINKING_STORAGE_ERROR') throw err;
+      if (ccAcct) releaseAccountById(ccAcct.id);
+      return { status: 503, body: { error: { type: 'api_error', code: err.code, message: err.message } } };
     }
     if (ccAcct) {
       connectParams.token = ccAcct.apiKey;
@@ -3875,13 +3901,15 @@ async function _handleChatCompletionsInner(body, context = {}) {
                 // fires even after an upstream wobble — exactly when reuse helps.
                 try {
                   const tc = r.sr?.toolCalls;
-                  const commitMsgs = [...connectMessages, {
+                  const commitMsgs = [...connectSessionMessages, {
                     role: 'assistant',
                     content: r.sr?.content || '',
                     ...(tc?.length ? { tool_calls: tc.map((t, idx) => ({ id: t.id || `tc_${idx}`, function: { name: t.name, arguments: t.argumentsJson || t.arguments || '' } })) } : {}),
                   }];
                   commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: r.sr?.reasoning || incomingConnectReasoning });
-                } catch { /* session commit is best-effort */ }
+                } catch (err) {
+                  if (err.code === 'NATIVE_THINKING_STORAGE_ERROR') log.error(`Chat[${reqId}]: ${err.message}`);
+                }
                 break;
               }
               // #225: a client-gone abort is not an account fault — stop the
@@ -4036,13 +4064,15 @@ async function _handleChatCompletionsInner(body, context = {}) {
         // Gate-checked + best-effort (no-op when reuse is off).
         try {
           const msg = r.out?.body?.choices?.[0]?.message;
-          const commitMsgs = [...connectMessages, {
+          const commitMsgs = [...connectSessionMessages, {
             role: 'assistant',
             content: msg?.content || '',
             ...(msg?.tool_calls ? { tool_calls: msg.tool_calls } : {}),
           }];
           commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: msg?.reasoning_content || incomingConnectReasoning });
-        } catch { /* session commit is best-effort */ }
+        } catch (err) {
+          if (err.code === 'NATIVE_THINKING_STORAGE_ERROR') log.error(`Chat[${reqId}]: ${err.message}`);
+        }
         return r.out;
       }
       if (r.kind === 'abort') {
