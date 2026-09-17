@@ -3,7 +3,7 @@
     "test/session-continuity.test.js",
     "test/chat-reuse-log.test.js"
   ],
-  "expectBaselinePass": 50,
+  "expectBaselinePass": 51,
   "mutations": [
     {
       "name": "root fallback fires even when pair evidence exists — a live session gets re-associated through the root",
@@ -23,5 +23,6 @@
       "anchor": "        if (now - state.lastSeen > ttl) { evictState(stateId); continue; }",
       "replacement": "        if (false) { evictState(stateId); continue; }"
     }
-  ]
+  ],
+  "_baseline_provenance": "Measured on Node 24.16.0 during functional integration stage 02, 2026-09-18: 51 passed, zero failed. Structured reporter, no forced exit."
 }

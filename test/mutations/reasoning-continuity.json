@@ -6,7 +6,7 @@
     "test/devin-connect-openai.test.js",
     "test/session-continuity-commit-fallback.test.js"
   ],
-  "expectBaselinePass": 317,
+  "expectBaselinePass": 318,
   "mutations": [
     {
       "name": "T1 store: the overlap-target commit path stops saving the reasoning tail",
@@ -47,20 +47,20 @@
     {
       "name": "T2 anthropic-in: incoming thinking no longer captured before the drop",
       "file": "src/handlers/messages.js",
-      "anchor": "        } else if (block.type === 'thinking') {\n          if (typeof block.thinking === 'string' && block.thinking) msgThinking.push(block.thinking);",
-      "replacement": "        } else if (block.type === 'thinking') {"
+      "anchor": "          if (typeof block.thinking === 'string' && block.thinking) msgThinking.push(block.thinking);",
+      "replacement": "          // Mutation: omit incoming thinking capture."
     },
     {
       "name": "T2 stream commit fallback dropped — outbound-empty reasoning no longer falls back to the inbound captured thinking (caught by test/session-continuity-commit-fallback.test.js stream fixture)",
       "file": "src/handlers/chat.js",
-      "anchor": "commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: r.sr?.reasoning || incomingConnectReasoning });",
-      "replacement": "commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: r.sr?.reasoning });"
+      "anchor": "commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: r.sr?.reasoning || incomingConnectReasoning });",
+      "replacement": "commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: r.sr?.reasoning });"
     },
     {
       "name": "T2 non-stream commit fallback dropped — same conjunction on the second call site (caught by the non-stream fixture)",
       "file": "src/handlers/chat.js",
-      "anchor": "commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: msg?.reasoning_content || incomingConnectReasoning });",
-      "replacement": "commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: msg?.reasoning_content });"
+      "anchor": "commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: msg?.reasoning_content || incomingConnectReasoning });",
+      "replacement": "commitConnectSession(callerKey || '', commitMsgs, connectSessionEnv, { reasoning: msg?.reasoning_content });"
     },
     {
       "name": "count clamp fractional hole — n=0.5 must fall back to the default 5, not Math.floor to a silent 0 (queue empty, digests gone)",
@@ -74,5 +74,6 @@
       "anchor": "if (!Number.isFinite(n) || n < 0 || (n > 0 && n < 1)) return 4000;",
       "replacement": "if (!Number.isFinite(n) || n < 0) return 4000;"
     }
-  ]
+  ],
+  "_baseline_provenance": "Measured on Node 24.16.0 during functional integration stage 02, 2026-09-18: 318 passed, zero failed. Structured reporter, no forced exit."
 }

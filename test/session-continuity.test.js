@@ -4,6 +4,7 @@ import {
   resolveSessionId,
   commitAfterResponse,
   isSessionReuseEnabled,
+  getSessionEnvForModel,
   isModelConfigStableEnabled,
   getSessionModelConfig,
   isReasoningInjectEnabled,
@@ -24,6 +25,23 @@ import {
 const ENV = { DEVIN_CONNECT_SESSION_REUSE: '1' };
 
 describe('session-continuity: gate', () => {
+  it('keeps excluded models out of session lookup and commit state', () => {
+    _resetForTests();
+    const env = { DEVIN_CONNECT_SESSION_REUSE: '1', DEVIN_CONNECT_MODEL_CONFIG_STABLE: '1', DEVIN_CONNECT_SESSION_MODELS: 'swe-2-high, swe-2-medium' };
+    const history = [{ role: 'user', content: 'model scope regression' }];
+    const sweEnv = getSessionEnvForModel('swe-2-high', env);
+    const id = resolveSessionId('scope-test', history, sweEnv);
+    const config = getSessionModelConfig('scope-test', history, sweEnv);
+    const otherEnv = getSessionEnvForModel('swe-1-7', env);
+    assert.equal(resolveSessionId('scope-test', history, otherEnv), null);
+    assert.equal(getSessionModelConfig('scope-test', history, otherEnv), null);
+    assert.equal(commitAfterResponse('scope-test', [...history, { role: 'assistant', content: 'other answer' }], otherEnv), null);
+    assert.equal(_getStoreSize(), 1);
+    assert.equal(resolveSessionId('scope-test', history, sweEnv), id);
+    assert.deepEqual(getSessionModelConfig('scope-test', history, sweEnv), config);
+    assert.equal(getSessionEnvForModel('swe-1-7', ENV), ENV, 'unset allowlist preserves existing behavior');
+    _resetForTests();
+  });
   it('isSessionReuseEnabled respects env values', () => {
     assert.equal(isSessionReuseEnabled({ DEVIN_CONNECT_SESSION_REUSE: '1' }), true);
     assert.equal(isSessionReuseEnabled({ DEVIN_CONNECT_SESSION_REUSE: 'true' }), true);
