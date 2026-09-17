@@ -6,6 +6,8 @@ accounts.creds.json.tmp
 native-thinking-signatures.json
 native-thinking-sessions.json
 native-thinking-*.json.*.tmp
+messages-identity-aliases.json
+messages-identity-aliases.json.*.tmp
 devin-connect-image-tag.json
 .devin-connect-calibrated.env
 model-access.json

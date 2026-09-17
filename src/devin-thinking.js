@@ -4,6 +4,8 @@ import path from 'node:path';
 import { config, log } from './config.js';
 import { NativeThinkingRegistry, nativeOrigin, MAX_NATIVE_RECORDS } from './native-thinking-registry.js';
 import { NATIVE_RETENTION_MS } from './native-thinking-storage.js';
+import { createHash } from 'node:crypto';
+import { messagesIdentityAliases, identityDiagnostic } from './messages-identity.js';
 
 const registryFile = path.join(config.dataDir, 'native-thinking-signatures.json');
 let registry;
@@ -58,6 +60,18 @@ export function stripForeignSignedThinking(messages, mode) {
     const { nativeThinkingBlocks: _blocks, reasoning_signature: _sig, ...legacy } = m;
     return legacy;
   });
+}
+
+export function resolveMessagesNativeScope(identity, messages, aliases = messagesIdentityAliases()) {
+  const signatures = messages.filter(m => m?.role === 'assistant').flatMap(blocksFor)
+    .map(b => b?.signature).filter(s => typeof s === 'string' && s);
+  if (!signatures.length) return { scope: identity.stableScope, reason: 'stable' };
+  const candidates = [...new Set([identity.stableScope, identity.legacyScope, ...aliases.candidates(identity)])];
+  const callers = getRegistry().callersForSignatures(signatures);
+  const matching = candidates.filter(scope => callers.has(createHash('sha256').update(scope).digest('hex')));
+  if (matching.length > 1) throw thinkingError('ambiguous messages identity; continue with the original client context.');
+  const scope = matching[0] || identity.stableScope;
+  return { scope, reason: !matching.length ? 'unregistered-scope' : scope === identity.stableScope ? 'stable' : scope === identity.legacyScope ? 'legacy-candidate' : 'verified-alias' };
 }
 
 // A signed assistant turn is one protocol message: repeated #6 tool calls share
@@ -154,6 +168,12 @@ export function prepareNativeThinking(params, now = Date.now(), { renew = true }
   // builder): validation still runs, but the retention/alias writes already
   // happened once and each is a full-file sync rewrite.
   if (renew && verifiedKeys.length) getRegistry().touch(verifiedKeys, now);
+  // The candidate scope was selected before account/session resolution. Learn
+  // it ONLY after every history block has passed the original strict checks.
+  if (renew && verifiedKeys.length && params.messagesIdentity) {
+    messagesIdentityAliases().confirm(params.messagesIdentity, params.nativeThinkingScope, now);
+    log.debug('Messages native identity verified', identityDiagnostic(params.messagesIdentity, params.nativeThinkingScope, 'history-verified', 'validated'));
+  }
   return { ...params, messages: normalized };
 }
 

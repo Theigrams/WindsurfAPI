@@ -70,6 +70,7 @@ function messagesHarness({ baseline = false, poisonIterator = false } = {}) {
       genMsgId: () => 'msg_synthetic',
       neutralizeClientIdentity: text => text,
       nativeThinkingEnabled: () => false,
+      messagesIdentity: () => null,
       SERVER_SIDE_ANTHROPIC_TOOL_TYPES: new Set(),
       convertServerSideTool: () => null,
       normalizeImageBlock: block => ({ type: 'image_url', image_url: { url: block.source?.data || '' } }),
